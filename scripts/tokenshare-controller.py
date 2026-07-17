@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import json
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,10 @@ class TokenshareError(RuntimeError):
     """A user-actionable controller error."""
 
 
+class PushNotApproved(TokenshareError):
+    """A successful local result which was intentionally not published."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Task:
     state: str
@@ -33,6 +38,7 @@ class Task:
 TASK_START = re.compile(
     r"^###\s+<task>\s+\[(Pending|WIP|Done)\]\s+(.+?)\s*$", re.MULTILINE
 )
+TASK_MARKER = re.compile(r"^###\s+<task>.*$", re.MULTILINE)
 TASK_END = re.compile(r"^###\s+</task>\s*$", re.MULTILINE)
 SECTION_FOR_STATE = {
     "Pending": "Pending Tasks",
@@ -41,9 +47,76 @@ SECTION_FOR_STATE = {
 }
 
 
+class Dashboard:
+    """A compact terminal feed with task information pinned to the bottom."""
+
+    def __init__(self, stream=None, *, enabled: bool | None = None) -> None:
+        self.stream = stream or sys.stderr
+        self.enabled = self.stream.isatty() if enabled is None else enabled
+        self.started = time.monotonic()
+        self.idle_since = self.started
+        self.repo = "Idle"
+        self.summary = "No active task"
+        self.active = False
+        self._footer_lines = 0
+
+    @staticmethod
+    def _stamp() -> str:
+        return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def _duration(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _erase_footer(self) -> None:
+        if self.enabled and self._footer_lines:
+            self.stream.write(f"\x1b[{self._footer_lines}A\x1b[J")
+
+    def _draw_footer(self) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        lines = [
+            f"Active task repo: {self.repo}",
+            f"Active task summary: {self.summary}",
+            f"Uptime: {self._duration(now - self.started)} | "
+            f"Idle: {self._duration(0 if self.active else now - self.idle_since)}",
+        ]
+        self.stream.write("\n".join(lines) + "\n")
+        self.stream.flush()
+        self._footer_lines = len(lines)
+
+    def message(self, message: str) -> None:
+        self._erase_footer()
+        print(f"[{self._stamp()}] {message}", file=self.stream, flush=True)
+        self._draw_footer()
+
+    def set_task(self, repo: Path | None, summary: str | None = None) -> None:
+        self._erase_footer()
+        if repo is None:
+            self.active = False
+            self.repo = "Idle"
+            self.summary = "No active task"
+            self.idle_since = time.monotonic()
+        else:
+            self.active = True
+            self.repo = str(repo)
+            self.summary = summary or ""
+        self._draw_footer()
+
+    def refresh(self) -> None:
+        self._erase_footer()
+        self._draw_footer()
+
+
+DASHBOARD = Dashboard()
+
+
 def log(message: str) -> None:
-    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    print(f"[{stamp}] {message}", file=sys.stderr, flush=True)
+    DASHBOARD.message(message)
 
 
 def run(
@@ -158,6 +231,13 @@ def section_ranges(text: str) -> dict[str, tuple[int, int]]:
 
 def parse_tasks(text: str) -> list[Task]:
     ranges = section_ranges(text)
+    for marker in TASK_MARKER.finditer(text):
+        if TASK_START.match(text, marker.start()) is None:
+            header = marker.group(0).strip()
+            raise TokenshareError(
+                f"Malformed task header {header!r}; expected "
+                "'### <task> [Pending|WIP|Done] Task title'"
+            )
     tasks: list[Task] = []
     cursor = 0
     while True:
@@ -230,18 +310,54 @@ def write_status(path: Path, task: Task, state: str, note: str = "") -> None:
     if note:
         entry += f"- Note: {note.replace(chr(10), ' ')}\n"
     path.write_text(existing + entry, encoding="utf-8")
+    detail = f"status.md: {state}"
+    if note:
+        detail += f" — {note.replace(chr(10), ' ')}"
+    log(detail)
 
 
 def git_commit_push(repo: Path, paths: Iterable[Path], message: str) -> None:
     relative = [str(path.relative_to(repo)) for path in paths]
     run(["git", "add", "--", *relative], cwd=repo)
-    staged = run(["git", "diff", "--cached", "--quiet"], cwd=repo, check=False)
+    staged = run(
+        ["git", "diff", "--cached", "--quiet", "--", *relative],
+        cwd=repo,
+        check=False,
+    )
     if staged.returncode == 0:
         return
     if staged.returncode != 1:
         raise TokenshareError(f"Unable to inspect staged changes in {repo}")
-    run(["git", "commit", "-m", message], cwd=repo)
+    run(["git", "commit", "--only", "-m", message, "--", *relative], cwd=repo)
     run(["git", "push"], cwd=repo)
+
+
+def git_commit_all(repo: Path, message: str) -> bool:
+    """Commit the complete successful task result without publishing it."""
+    run(["git", "add", "--all"], cwd=repo)
+    staged = run(["git", "diff", "--cached", "--quiet"], cwd=repo, check=False)
+    if staged.returncode == 0:
+        return False
+    if staged.returncode != 1:
+        raise TokenshareError(f"Unable to inspect staged changes in {repo}")
+    run(["git", "commit", "-m", message], cwd=repo)
+    return True
+
+
+def approve_push(repo: Path, task: Task, *, auto_push: bool) -> bool:
+    if auto_push:
+        log(f"Auto-push approved for {repo.name}: {task.title}")
+        return True
+    prompt = f"Push successful task changes for {repo.name} ({task.title})? [y/N] "
+    try:
+        with open("/dev/tty", "r+", encoding="utf-8") as terminal:
+            terminal.write(prompt)
+            terminal.flush()
+            answer = terminal.readline()
+    except OSError:
+        log("Push approval required, but no interactive terminal is available")
+        return False
+    return answer.strip().lower() in {"y", "yes"}
 
 
 def agent_prompt(task: Task, status_path: Path, phase: str) -> str:
@@ -252,6 +368,7 @@ def agent_prompt(task: Task, status_path: Path, phase: str) -> str:
             "Review the implementation for this task, run the appropriate test suite, fix all "
             "failures or omissions, and verify the result."
         )
+    completion_marker = phase_completion_marker(phase)
     return f"""You are the unattended Tokenshare coding agent in the target repository.
 There is no human interface. Do not ask questions. Use the task alone, inspect repository
 instructions, and make the smallest reasonable assumptions needed to finish.
@@ -262,12 +379,34 @@ Status file: {status_path}
 {task.body.rstrip()}
 
 {action}
-Commit and push all code and test changes using the current Git configuration before exiting.
+Leave all code and test changes uncommitted in the working tree. Do not commit or push; the
+controller owns commits and publication after successful verification.
 Do not edit tokenshare_tasklist.md; the controller owns task transitions.
+Add concise timestamped progress notes to the supplied status file when meaningful milestones
+are reached. Do not write progress updates to the controller terminal.
+After every requirement for this phase is finished, append a final timestamped status entry and
+then append this exact marker on its own line:
+{completion_marker}
+This marker is the controller handshake. Never write it until the phase is fully complete. The
+TUI may remain open afterward; the controller will detect the marker and close the session.
 """
 
 
-def run_agent(repo: Path, command: str, task: Task, status_path: Path, phase: str) -> None:
+def phase_completion_marker(phase: str) -> str:
+    return f"<!-- tokenshare-agent-phase:{phase}:complete -->"
+
+
+def _agent_kind(executable: str) -> str | None:
+    name = Path(executable).name.removesuffix(".sh")
+    for kind in ("codex", "claude", "opencode"):
+        if name == kind or name.startswith(f"{kind}-"):
+            return kind
+    return None
+
+
+def _agent_args(
+    command: str, prompt: str, repo: Path, *, resume: bool = False
+) -> list[str]:
     args = shlex.split(command, posix=os.name != "nt")
     if os.name == "nt":
         args = [
@@ -278,6 +417,82 @@ def run_agent(repo: Path, command: str, task: Task, status_path: Path, phase: st
         ]
     if not args:
         raise TokenshareError("Agent command is empty")
+    kind = _agent_kind(args[0])
+    if kind == "codex":
+        escaped_repo = str(repo.resolve()).replace("\\", "\\\\").replace('"', '\\"')
+        args.extend(["--config", f'projects."{escaped_repo}".trust_level="trusted"'])
+    elif kind == "claude" and "--dangerously-skip-permissions" not in args:
+        args.append("--dangerously-skip-permissions")
+    elif kind == "opencode" and "--auto" not in args:
+        args.append("--auto")
+    if resume and kind == "codex":
+        return [*args, "resume", "--last", prompt]
+    if resume and kind == "claude":
+        return [*args, "--continue", prompt]
+    if kind == "opencode":
+        continuation = ["--continue"] if resume else []
+        return [*args, *continuation, "--prompt", prompt]
+    return [*args, prompt]
+
+
+def resolve_agent_command(agent: str | None, agent_command: str) -> str:
+    """Resolve an agent stub name/path, falling back to the raw command."""
+    if not agent:
+        return agent_command
+    requested = Path(agent).expanduser()
+    candidates: list[Path]
+    if requested.is_absolute() or requested.parent != Path("."):
+        candidates = [requested]
+    else:
+        project_root = Path(__file__).resolve().parents[1]
+        stub_dirs = [
+            project_root / "skills" / "tokenshare" / "scripts" / "agent-stubs",
+            Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+            / "skills" / "tokenshare" / "scripts" / "agent-stubs",
+        ]
+        names = [requested] if requested.suffix else [requested, requested.with_suffix(".sh")]
+        candidates = [directory / name for directory in stub_dirs for name in names]
+    stub = next((path.resolve() for path in candidates if path.is_file()), None)
+    if stub is None:
+        searched = ", ".join(str(path) for path in candidates)
+        raise TokenshareError(f"Agent stub {agent!r} not found (searched: {searched})")
+    if not os.access(stub, os.X_OK):
+        raise TokenshareError(f"Agent stub is not executable: {stub}")
+    return shlex.quote(str(stub))
+
+
+def _new_status_entries(path: Path, previous: str) -> tuple[str, list[str]]:
+    current = path.read_text(encoding="utf-8") if path.exists() else ""
+    if current == previous:
+        return current, []
+    addition = current[len(previous):] if current.startswith(previous) else current
+    entries: list[str] = []
+    for block in re.split(r"(?=^##\s+)", addition, flags=re.MULTILINE):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if lines and lines[0].startswith("## "):
+            entries.append(" | ".join(line.removeprefix("- ") for line in lines))
+    return current, entries
+
+
+def _run_agent_once(
+    repo: Path,
+    command: str,
+    task: Task,
+    status_path: Path,
+    phase: str,
+    *,
+    use_tmux: bool = True,
+    resume: bool = False,
+) -> int:
+    prompt = (
+        "Continue the current Tokenshare task from where the session stopped. "
+        f"The current phase is {phase}; keep updating {status_path} and finish all remaining work. "
+        "Only after the phase is fully finished, append this exact controller handshake on its "
+        f"own line: {phase_completion_marker(phase)}"
+        if resume
+        else agent_prompt(task, status_path, phase)
+    )
+    args = _agent_args(command, prompt, repo, resume=resume)
     env = os.environ.copy()
     env.update(
         {
@@ -286,17 +501,104 @@ def run_agent(repo: Path, command: str, task: Task, status_path: Path, phase: st
             "TOKENSHARE_STATUS_FILE": str(status_path),
         }
     )
-    result = subprocess.run(
-        args,
-        cwd=repo,
-        input=agent_prompt(task, status_path, phase),
-        text=True,
-        env=env,
-    )
-    if result.returncode:
-        raise TokenshareError(
-            f"Coding agent exited with status {result.returncode} during {phase}"
+    if _agent_kind(args[0]) == "opencode":
+        env["OPENCODE_PERMISSION"] = json.dumps(
+            {"*": "allow", "external_directory": "allow"}, separators=(",", ":")
         )
+    if not use_tmux:
+        result = subprocess.run(args, cwd=repo, text=True, env=env)
+        returncode = result.returncode
+    else:
+        if not run(["tmux", "-V"], check=False).returncode == 0:
+            raise TokenshareError("tmux is required by default; install it or pass --no-tmux")
+        safe_title = re.sub(r"[^A-Za-z0-9_-]+", "-", task.title).strip("-")[:30]
+        session = f"tokenshare-{os.getpid()}-{safe_title or 'agent'}-{phase[:4]}"
+        run(["tmux", "new-session", "-d", "-s", session, "-c", str(repo)])
+        run(["tmux", "set-option", "-t", session, "remain-on-exit", "on"])
+        tmux_args = [
+            "tmux", "respawn-pane", "-k", "-t", session, "-c", str(repo),
+            "-e", f"TOKENSHARE_TASK_TITLE={task.title}",
+            "-e", f"TOKENSHARE_TASK_STATE={phase}",
+            "-e", f"TOKENSHARE_STATUS_FILE={status_path}",
+        ]
+        if "OPENCODE_PERMISSION" in env:
+            tmux_args.extend(["-e", f"OPENCODE_PERMISSION={env['OPENCODE_PERMISSION']}"])
+        tmux_args.extend(args)
+        run(tmux_args)
+        log(f"Agent TUI is available in tmux session {session!r} (attach: tmux attach -t {session})")
+        previous = status_path.read_text(encoding="utf-8") if status_path.exists() else ""
+        returncode = 1
+        try:
+            while True:
+                state = run(
+                    ["tmux", "display-message", "-p", "-t", session,
+                     "#{pane_dead} #{pane_dead_status}"], check=False,
+                )
+                if state.returncode:
+                    raise TokenshareError(f"tmux agent session {session!r} disappeared")
+                values = state.stdout.strip().split()
+                previous, entries = _new_status_entries(status_path, previous)
+                for entry in entries:
+                    log(f"status.md: {entry}")
+                DASHBOARD.refresh()
+                if phase_completion_marker(phase) in previous:
+                    log(f"Agent reported {phase} phase complete")
+                    returncode = 0
+                    break
+                if values and values[0] == "1":
+                    returncode = int(values[1]) if len(values) > 1 else 1
+                    break
+                time.sleep(1)
+        finally:
+            run(["tmux", "kill-session", "-t", session], check=False)
+    return returncode
+
+
+def _retry_wait(seconds: int) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        DASHBOARD.refresh()
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+
+
+def run_agent(
+    repo: Path,
+    command: str,
+    task: Task,
+    status_path: Path,
+    phase: str,
+    *,
+    use_tmux: bool = True,
+) -> None:
+    attempt = 0
+    while True:
+        try:
+            returncode = _run_agent_once(
+                repo,
+                command,
+                task,
+                status_path,
+                phase,
+                use_tmux=use_tmux,
+                resume=attempt > 0,
+            )
+            failure = f"exited with status {returncode}"
+        except (TokenshareError, OSError, subprocess.SubprocessError) as exc:
+            returncode = 1
+            failure = str(exc)
+        if returncode == 0:
+            if attempt:
+                log(f"Agent connection restored during {phase}")
+            return
+        attempt += 1
+        delay = attempt * 5
+        kind = _agent_kind(shlex.split(command, posix=os.name != "nt")[0])
+        action = "continuing session" if kind in {"codex", "claude", "opencode"} else "restarting agent"
+        log(
+            f"Agent {failure} during {phase}; {action} in {delay} seconds "
+            f"(retry {attempt})"
+        )
+        _retry_wait(delay)
 
 
 def status_filename(repo: Path) -> Path:
@@ -308,7 +610,16 @@ def status_filename(repo: Path) -> Path:
     return candidate
 
 
-def process_task(repo: Path, tasklist: Path, task: Task, agent_command: str) -> None:
+def process_task(
+    repo: Path,
+    tasklist: Path,
+    task: Task,
+    agent_command: str,
+    *,
+    use_tmux: bool = True,
+    auto_push: bool = False,
+) -> None:
+    DASHBOARD.set_task(repo, task.title)
     log(f"Claiming {repo.name}: {task.title}")
     status_path = status_filename(repo)
     write_status(status_path, task, "implementing")
@@ -322,12 +633,10 @@ def process_task(repo: Path, tasklist: Path, task: Task, agent_command: str) -> 
         if item.state == "WIP" and item.title == task.title
     )
     try:
-        run_agent(repo, agent_command, wip_task, status_path, "implementing")
-        ensure_clean(repo)
+        run_agent(repo, agent_command, wip_task, status_path, "implementing", use_tmux=use_tmux)
         write_status(status_path, wip_task, "testing")
         git_commit_push(repo, [status_path], f"tokenshare: test {task.title}")
-        run_agent(repo, agent_command, wip_task, status_path, "testing")
-        ensure_clean(repo)
+        run_agent(repo, agent_command, wip_task, status_path, "testing", use_tmux=use_tmux)
         write_status(status_path, wip_task, "complete")
         current = tasklist.read_text(encoding="utf-8")
         refreshed = next(
@@ -336,7 +645,15 @@ def process_task(repo: Path, tasklist: Path, task: Task, agent_command: str) -> 
             if item.state == "WIP" and item.title == task.title
         )
         tasklist.write_text(transition_task(current, refreshed, "Done"), encoding="utf-8")
-        git_commit_push(repo, [tasklist, status_path], f"tokenshare: complete {task.title}")
+        git_commit_all(repo, f"tokenshare: complete {task.title}")
+        if not approve_push(repo, task, auto_push=auto_push):
+            raise PushNotApproved(
+                f"Push not approved; successful changes remain committed locally in {repo}. "
+                f"Publish them with: git -C {shlex.quote(str(repo))} push"
+            )
+        run(["git", "push"], cwd=repo)
+    except PushNotApproved:
+        raise
     except Exception as exc:
         write_status(status_path, wip_task, "failed", str(exc))
         try:
@@ -345,9 +662,16 @@ def process_task(repo: Path, tasklist: Path, task: Task, agent_command: str) -> 
             log(f"Could not push failure status: {record_error}")
         raise
     log(f"Completed {repo.name}: {task.title}")
+    DASHBOARD.set_task(None)
 
 
-def scan_repositories(repos: Sequence[Path], agent_command: str) -> int:
+def scan_repositories(
+    repos: Sequence[Path],
+    agent_command: str,
+    *,
+    use_tmux: bool = True,
+    auto_push: bool = False,
+) -> int:
     tasklists = [(repo, find_tasklist(repo)) for repo in repos]
     completed = 0
     while True:
@@ -374,29 +698,43 @@ def scan_repositories(repos: Sequence[Path], agent_command: str) -> int:
         )
         if pending is None:
             return completed
-        process_task(*pending, agent_command)
+        process_task(
+            *pending, agent_command, use_tmux=use_tmux, auto_push=auto_push
+        )
         completed += 1
 
 
 def build_parser() -> argparse.ArgumentParser:
-    project_root = Path(__file__).resolve().parents[1]
-    checkout_config = project_root / "config" / "task_repos.md"
-    installed_config = Path.home() / ".config" / "tokenshare" / "task_repos.md"
-    default_config = checkout_config if checkout_config.is_file() else installed_config
+    script = Path(__file__).resolve()
+    project_root = script.parents[1]
+    checkout_root = (
+        project_root
+        if (project_root / "config" / "task_repos.md").is_file()
+        else Path.home() / "dev" / "tokenshare"
+    )
+    checkout_config = checkout_root / "config" / "task_repos.md"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(os.environ.get("TOKENSHARE_CONFIG", default_config)),
+        default=Path(os.environ.get("TOKENSHARE_CONFIG", checkout_config)),
     )
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=Path(os.environ.get("TOKENSHARE_WORKSPACE", Path.home() / "tokenshare-dev")),
+        default=Path(os.environ.get("TOKENSHARE_WORKSPACE", checkout_root / "dev")),
     )
-    parser.add_argument(
+    agent_group = parser.add_mutually_exclusive_group()
+    agent_group.add_argument(
+        "-a", "--agent",
+        default=os.environ.get("TOKENSHARE_AGENT"),
+        metavar="STUB",
+        help="Agent stub name or executable path (for example: codex-gpt-56-sol)",
+    )
+    agent_group.add_argument(
         "--agent-command",
-        default=os.environ.get("TOKENSHARE_AGENT_COMMAND", "codex exec --full-auto -"),
+        default=os.environ.get("TOKENSHARE_AGENT_COMMAND", "codex --full-auto"),
+        help="Raw native agent command (advanced override)",
     )
     parser.add_argument(
         "--poll-seconds",
@@ -404,6 +742,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=float(os.environ.get("TOKENSHARE_POLL_SECONDS", "60")),
     )
     parser.add_argument("--once", action="store_true", help="Drain current Pending tasks and exit")
+    parser.add_argument(
+        "--no-tmux", action="store_true",
+        help="Run the agent directly (mainly useful for tests and noninteractive automation)",
+    )
+    parser.add_argument(
+        "--auto-push",
+        action="store_true",
+        default=os.environ.get("TOKENSHARE_AUTO_PUSH", "").lower() in {"1", "true", "yes"},
+        help="Pre-approve publishing coding changes after successful testing",
+    )
     return parser
 
 
@@ -411,19 +759,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.poll_seconds <= 0:
         raise TokenshareError("--poll-seconds must be greater than zero")
+    agent_command = resolve_agent_command(args.agent, args.agent_command)
     urls = read_repo_urls(args.config.expanduser().resolve())
     names = [repo_name(url) for url in urls]
     if len(names) != len(set(names)):
         raise TokenshareError("Configured repositories must have unique repository names")
 
     while True:
-        repos = [sync_repo(url, args.workspace.expanduser().resolve()) for url in urls]
-        completed = scan_repositories(repos, args.agent_command)
+        repos = []
+        for url in urls:
+            log(f"Checking repository {repo_name(url)}")
+            repos.append(sync_repo(url, args.workspace.expanduser().resolve()))
+        completed = scan_repositories(
+            repos,
+            agent_command,
+            use_tmux=not args.no_tmux,
+            auto_push=args.auto_push,
+        )
         if args.once:
             return 0
         if not completed:
             log(f"No Pending tasks; checking again in {args.poll_seconds:g} seconds")
-        time.sleep(args.poll_seconds)
+        deadline = time.monotonic() + args.poll_seconds
+        while time.monotonic() < deadline:
+            DASHBOARD.refresh()
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
 
 
 if __name__ == "__main__":

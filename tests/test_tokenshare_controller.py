@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "tokenshare-controller.py"
@@ -37,6 +38,120 @@ TWO_TASKS = TASKLIST.replace(
 
 
 class TaskParsingTests(unittest.TestCase):
+    def test_checkout_defaults_use_root_config_and_dev_workspace(self):
+        args = controller.build_parser().parse_args([])
+        root = SCRIPT.parents[1]
+        self.assertEqual(args.config, root / "config" / "task_repos.md")
+        self.assertEqual(args.workspace, root / "dev")
+        self.assertEqual(args.agent_command, "codex --full-auto")
+        self.assertIsNone(args.agent)
+        self.assertFalse(args.no_tmux)
+        self.assertFalse(args.auto_push)
+
+    def test_agent_flag_resolves_named_and_path_stubs(self):
+        args = controller.build_parser().parse_args(["-a", "codex-gpt-56-sol"])
+        command = controller.resolve_agent_command(args.agent, args.agent_command)
+        self.assertEqual(
+            Path(command),
+            SCRIPT.parents[1]
+            / "skills" / "tokenshare" / "scripts" / "agent-stubs"
+            / "codex-gpt-56-sol.sh",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            stub = Path(directory) / "custom-agent"
+            stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            stub.chmod(0o755)
+            self.assertEqual(
+                Path(controller.resolve_agent_command(str(stub), "unused")), stub.resolve()
+            )
+
+    def test_agent_flag_rejects_missing_stub(self):
+        with self.assertRaisesRegex(controller.TokenshareError, "not found"):
+            controller.resolve_agent_command("definitely-missing-agent", "unused")
+
+    def test_codex_command_trusts_the_task_repo_for_the_invocation(self):
+        repo = Path("/tmp/task repo")
+        args = controller._agent_args("codex --full-auto", "do work", repo)
+        self.assertEqual(args[-1], "do work")
+        self.assertIn("--config", args)
+        self.assertIn(
+            f'projects."{repo.resolve()}".trust_level="trusted"', args
+        )
+
+    def test_non_codex_command_does_not_receive_codex_config(self):
+        args = controller._agent_args("claude", "do work", Path("/tmp/repo"))
+        self.assertEqual(
+            args, ["claude", "--dangerously-skip-permissions", "do work"]
+        )
+
+    def test_opencode_auto_approves_access(self):
+        args = controller._agent_args("opencode", "do work", Path("/tmp/repo"))
+        self.assertEqual(args, ["opencode", "--auto", "--prompt", "do work"])
+
+    def test_provider_prefixed_stubs_receive_their_trust_flags(self):
+        claude = controller._agent_args(
+            "/tmp/claude-sonnet.sh", "do work", Path("/tmp/repo")
+        )
+        opencode = controller._agent_args(
+            "/tmp/opencode-gpt.sh", "do work", Path("/tmp/repo")
+        )
+        self.assertIn("--dangerously-skip-permissions", claude)
+        self.assertIn("--auto", opencode)
+
+    def test_provider_resume_arguments(self):
+        repo = Path("/tmp/repo")
+        codex = controller._agent_args("codex", "continue", repo, resume=True)
+        claude = controller._agent_args("claude", "continue", repo, resume=True)
+        opencode = controller._agent_args("opencode", "continue", repo, resume=True)
+        self.assertEqual(codex[-3:], ["resume", "--last", "continue"])
+        self.assertEqual(claude[-2:], ["--continue", "continue"])
+        self.assertEqual(opencode[-3:], ["--continue", "--prompt", "continue"])
+
+    def test_failed_agent_retries_with_incremental_backoff_and_resume(self):
+        task = controller.parse_tasks(TASKLIST)[0]
+        with mock.patch.object(
+            controller, "_run_agent_once", side_effect=[1, 1, 0]
+        ) as run_mock, mock.patch.object(controller, "_retry_wait") as wait_mock:
+            controller.run_agent(
+                Path("/tmp/repo"), "codex", task, Path("/tmp/status.md"),
+                "implementing",
+            )
+        self.assertEqual(wait_mock.call_args_list, [mock.call(5), mock.call(10)])
+        self.assertFalse(run_mock.call_args_list[0].kwargs["resume"])
+        self.assertTrue(run_mock.call_args_list[1].kwargs["resume"])
+        self.assertTrue(run_mock.call_args_list[2].kwargs["resume"])
+
+    def test_opencode_child_gets_allow_all_permission_environment(self):
+        task = controller.parse_tasks(TASKLIST)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            with mock.patch.object(
+                controller.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0),
+            ) as run_mock:
+                controller.run_agent(
+                    repo, "opencode", task, repo / "status.md", "implementing",
+                    use_tmux=False,
+                )
+            environment = run_mock.call_args.kwargs["env"]
+            self.assertEqual(
+                environment["OPENCODE_PERMISSION"],
+                '{"*":"allow","external_directory":"allow"}',
+            )
+
+    def test_agent_prompt_contains_phase_completion_handshake(self):
+        task = controller.parse_tasks(TASKLIST)[0]
+        prompt = controller.agent_prompt(task, Path("status.md"), "implementing")
+        self.assertIn(controller.phase_completion_marker("implementing"), prompt)
+        self.assertNotIn(controller.phase_completion_marker("testing"), prompt)
+
+    def test_push_requires_approval_unless_preapproved(self):
+        task = controller.parse_tasks(TASKLIST)[0]
+        with mock.patch("builtins.open", side_effect=OSError):
+            self.assertFalse(controller.approve_push(Path("repo"), task, auto_push=False))
+        self.assertTrue(controller.approve_push(Path("repo"), task, auto_push=True))
+
     def test_parses_and_moves_task_between_sections(self):
         tasks = controller.parse_tasks(TASKLIST)
         self.assertEqual([(task.state, task.title) for task in tasks], [
@@ -52,6 +167,11 @@ class TaskParsingTests(unittest.TestCase):
     def test_rejects_task_in_wrong_section(self):
         invalid = TASKLIST.replace("[Pending] Implement", "[WIP] Implement")
         with self.assertRaisesRegex(controller.TokenshareError, "not under"):
+            controller.parse_tasks(invalid)
+
+    def test_rejects_misspelled_task_state_instead_of_treating_queue_as_empty(self):
+        invalid = TASKLIST.replace("[Pending]", "[Pendig]", 1)
+        with self.assertRaisesRegex(controller.TokenshareError, "Malformed task header"):
             controller.parse_tasks(invalid)
 
     def test_finds_exactly_one_tasklist(self):
@@ -107,8 +227,7 @@ class ControllerIntegrationTests(unittest.TestCase):
             fake_agent.write_text(
                 "import pathlib, sys\n"
                 "sys.stdin.read()\n"
-                "pathlib.Path('agent-ran.txt').write_text('ok\\n', encoding='utf-8')\n"
-                "pathlib.Path('agent-ran.txt').unlink()\n",
+                "pathlib.Path('agent-result.txt').write_text('ok\\n', encoding='utf-8')\n",
                 encoding="utf-8",
             )
             config = root / "task_repos.md"
@@ -131,6 +250,8 @@ class ControllerIntegrationTests(unittest.TestCase):
                         "--config", str(config),
                         "--workspace", str(workspace),
                         "--agent-command", command,
+                        "--no-tmux",
+                        "--auto-push",
                         "--once",
                     ]
                 )
@@ -149,6 +270,11 @@ class ControllerIntegrationTests(unittest.TestCase):
                 self.assertIn("- State: implementing", status_text)
                 self.assertIn("- State: testing", status_text)
                 self.assertIn("- State: complete", status_text)
+            published = subprocess.run(
+                ["git", f"--git-dir={remote}", "show", "HEAD:agent-result.txt"],
+                check=True, stdout=subprocess.PIPE, text=True,
+            )
+            self.assertEqual(published.stdout, "ok\n")
 
 
 if __name__ == "__main__":
