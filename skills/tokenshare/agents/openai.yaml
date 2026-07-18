@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tokenshare"
+  short_description: "Run unattended repository coding tasks"
+  default_prompt: "Use $tokenshare to process configured repository task queues unattended."
