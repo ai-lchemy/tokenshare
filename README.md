@@ -1,5 +1,7 @@
 # Tokenshare
 
+[![Support ai-lchemy on Ko-fi](https://img.shields.io/badge/Support%20on-Ko--fi-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/ai.lchemy)
+
 Tokenshare is a persistent Python controller plus AIML skill that monitors Git repositories for autonomous coding tasks. It uses the current user's existing Git authentication, clones configured repositories beneath the checkout's `dev/` directory, and processes one task at a time.
 
 ## Repository layout
