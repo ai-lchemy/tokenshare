@@ -1,29 +1,33 @@
 # Tokenshare
 
-[![Support ai-lchemy on Ko-fi](https://img.shields.io/badge/Support%20on-Ko--fi-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/ai.lchemy)
-
-Tokenshare is a persistent Python controller plus AIML skill that monitors Git repositories for autonomous coding tasks. It uses the current user's existing Git authentication, clones configured repositories beneath the checkout's `dev/` directory, and processes one task at a time.
+Tokenshare is a persistent Python controller plus AIML skill that monitors Git repositories for autonomous coding tasks. It uses the current user's existing Git authentication, clones configured repositories beneath a user-selected development directory, and processes one task at a time.
 
 ## Repository layout
 
 ```text
 config/task_repos.md      # the repository URL list that matters
-dev/                      # cloned task repositories only
 scripts/tokenshare-controller.py
 skills/tokenshare/SKILL.md
 tests/test_tokenshare_controller.py
-install.sh
+install.py
 ```
 
 ## Quick start
 
-1. Add one repository URL per line to `/home/kasm-user/dev/tokenshare/config/task_repos.md`.
-2. Add `tokenshare_tasklist.md` to the root or `docs/` directory of every configured repository.
-3. Ensure `git clone`, `git pull`, and `git push` already work with your normal credentials.
-4. Start the controller:
+1. Run `python3 install.py`. Enter the absolute development directory in which task repositories should be cloned, or press Enter for `~/tokenshare_dev/`.
+2. Add one repository URL per line to `config/task_repos.md` in the Tokenshare installation directory.
+3. Add `tokenshare_tasklist.md` to the root or `docs/` directory of every configured repository.
+4. Ensure `git clone`, `git pull`, and `git push` already work with your normal credentials.
+5. Start the controller:
 
 ```bash
 python3 scripts/tokenshare-controller.py
+```
+
+The development directory can also be supplied noninteractively. It must be absolute, and is created when necessary:
+
+```bash
+python3 install.py -dd /absolute/path/to/tokenshare_dev
 ```
 
 For a finite local test, use:
@@ -73,8 +77,8 @@ Section names and task states are exact. Each task moves `Pending -> WIP -> Done
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `TOKENSHARE_CONFIG` | `/home/kasm-user/dev/tokenshare/config/task_repos.md` | Repository-list path |
-| `TOKENSHARE_WORKSPACE` | `/home/kasm-user/dev/tokenshare/dev` | Clone parent directory |
+| `TOKENSHARE_CONFIG` | `<installation directory>/config/task_repos.md` | Repository-list path |
+| `TOKENSHARE_WORKSPACE` | development directory selected during installation (default `~/tokenshare_dev`) | Clone parent directory |
 | `TOKENSHARE_AGENT_COMMAND` | `codex --full-auto` | Native agent TUI command |
 | `TOKENSHARE_AGENT` | unset | Agent stub name or executable path |
 | `TOKENSHARE_POLL_SECONDS` | `60` | Monitor interval |

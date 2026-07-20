@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import pty
@@ -40,15 +41,34 @@ TWO_TASKS = TASKLIST.replace(
 
 class TaskParsingTests(unittest.TestCase):
     def test_checkout_defaults_use_root_config_and_dev_workspace(self):
-        args = controller.build_parser().parse_args([])
+        with mock.patch.dict(os.environ, {"TOKENSHARE_INSTALL_METADATA": "/missing"}):
+            args = controller.build_parser().parse_args([])
         root = SCRIPT.parents[1]
         self.assertEqual(args.config, root / "config" / "task_repos.md")
-        self.assertEqual(args.workspace, root / "dev")
+        self.assertEqual(args.workspace, Path.home() / "tokenshare_dev")
         self.assertEqual(args.agent_command, "codex --full-auto")
         self.assertIsNone(args.agent)
         self.assertFalse(args.no_tmux)
         self.assertFalse(args.auto_push)
         self.assertIsNone(args.auto_attach)
+
+    def test_installed_defaults_come_from_install_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = root / "install.json"
+            metadata.write_text(
+                json.dumps({
+                    "install_directory": "/opt/tokenshare",
+                    "development_directory": "/work/repos",
+                }),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ, {"TOKENSHARE_INSTALL_METADATA": str(metadata)}, clear=False
+            ):
+                args = controller.build_parser().parse_args([])
+            self.assertEqual(args.config, Path("/opt/tokenshare/config/task_repos.md"))
+            self.assertEqual(args.workspace, Path("/work/repos"))
 
     def test_auto_attach_accepts_current_or_explicit_tty(self):
         parser = controller.build_parser()

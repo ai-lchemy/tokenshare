@@ -9,7 +9,7 @@ Operate Tokenshare as an unattended process. Assume the task text is the complet
 
 ## Configure
 
-1. Add one Git repository URL per line to `/home/kasm-user/dev/tokenshare/config/task_repos.md`.
+1. Add one Git repository URL per line to `config/task_repos.md` in the Tokenshare installation directory.
 2. Ensure the current user's normal Git credentials can clone, pull, and push every repository.
 3. Put exactly one `tokenshare_tasklist.md` in each repository root or its `docs/` directory.
 4. Write complete, unambiguous tasks under `## Pending Tasks` using the documented `<task>` block format.

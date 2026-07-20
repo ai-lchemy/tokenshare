@@ -926,12 +926,34 @@ def scan_repositories(
 def build_parser() -> argparse.ArgumentParser:
     script = Path(__file__).resolve()
     project_root = script.parents[1]
-    checkout_root = (
-        project_root
-        if (project_root / "config" / "task_repos.md").is_file()
-        else Path.home() / "dev" / "tokenshare"
-    )
+    install_metadata = Path(
+        os.environ.get(
+            "TOKENSHARE_INSTALL_METADATA",
+            Path.home() / ".config" / "tokenshare" / "install.json",
+        )
+    ).expanduser()
+    metadata: dict[str, str] = {}
+    if install_metadata.is_file():
+        try:
+            loaded = json.loads(install_metadata.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                metadata = {
+                    key: value
+                    for key, value in loaded.items()
+                    if isinstance(key, str) and isinstance(value, str)
+                }
+        except (OSError, json.JSONDecodeError):
+            pass
+    checkout_root = Path(
+        os.environ.get(
+            "TOKENSHARE_ROOT",
+            metadata.get("install_directory", project_root),
+        )
+    ).expanduser()
     checkout_config = checkout_root / "config" / "task_repos.md"
+    development_directory = Path(
+        metadata.get("development_directory", Path.home() / "tokenshare_dev")
+    ).expanduser()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
@@ -941,7 +963,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=Path(os.environ.get("TOKENSHARE_WORKSPACE", checkout_root / "dev")),
+        default=Path(os.environ.get("TOKENSHARE_WORKSPACE", development_directory)),
     )
     agent_group = parser.add_mutually_exclusive_group()
     agent_group.add_argument(
