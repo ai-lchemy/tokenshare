@@ -1,6 +1,6 @@
 # Tokenshare
 
-Tokenshare is a persistent Python controller plus AIML skill that monitors Git repositories for autonomous coding tasks. It uses the current user's existing Git authentication, clones configured repositories beneath a user-selected development directory, and processes one task at a time.
+Tokenshare is a persistent Python controller plus AIML skill that monitors Git repositories for autonomous coding tasks. It uses the current user's existing Git authentication, clones configured repositories beneath a user-selected development directory, and publishes each completed task on its own review branch.
 
 ## Repository layout
 
@@ -57,7 +57,19 @@ Native TUIs do not need to exit when their work is done. Each phase prompt suppl
 
 Use `--auto-attach` to show every agent phase and retry in the controller's current terminal, or provide an exact terminal such as `--auto-attach /dev/pts/3`. `TOKENSHARE_AUTO_ATTACH` accepts `current`, a truthy value, or a TTY path. Existing tmux clients are switched to the agent and restored afterward; plain terminals are attached directly. Invalid or disappearing targets stop processing instead of silently running detached. `--auto-attach` cannot be combined with `--no-tmux`.
 
-Coding agents leave their changes uncommitted. After implementation and testing both succeed, the controller commits the complete result and asks for approval before pushing it. Use `--auto-push` or `TOKENSHARE_AUTO_PUSH=1` to pre-approve successful pushes for unattended operation. A failed implementation is never included in a coding-change push.
+Coding agents leave their changes uncommitted. The controller creates a branch named `tokenshare-dev-<task-title>-<fingerprint>` from the remote default branch, then pushes the WIP claim, testing status, failure status, and completed result to that branch. It never pushes, merges, or deletes the remote default branch. Maintainers can inspect the branch directly or open a pull/merge request using their hosting service. This uses ordinary Git operations and does not depend on a GitHub, GitLab, or Bitbucket API.
+
+By default, an unmerged Tokenshare branch blocks later tasks in the same repository while other repositories continue. To permit several completed review branches at once, add this before the task sections:
+
+```markdown
+## Configuration
+
+allow-multiple-branches: true
+```
+
+Agents still run sequentially, and every branch starts independently from the latest remote default branch. Multiple branches can therefore require tasklist conflict resolution when merged out of order. Configuration keys and boolean values are validated strictly.
+
+Incomplete branches resume automatically after a restart. A branch deleted without being merged is treated as declined, and its unchanged task is skipped using local state in `~/.config/tokenshare/state.json`. Editing the task body makes it eligible again. Task titles must be unique and act as stable identities; a rename intentionally creates a different task.
 
 ## Tasklist format
 
@@ -71,7 +83,7 @@ Coding agents leave their changes uncommitted. After implementation and testing 
 ## Completed Tasks
 ```
 
-Section names and task states are exact. Each task moves `Pending -> WIP -> Done`. During execution the controller creates `docs/status_YYYY-MM-DD_HH-MM-SS.md` and records `implementing`, `testing`, then `complete`. A failed agent leaves the task WIP.
+Section names and task states are exact. Each task moves `Pending -> WIP -> Done` on its review branch; the default branch remains Pending until a maintainer merges that branch. During execution the controller creates `docs/status_YYYY-MM-DD_HH-MM-SS.md` with the task fingerprint and branch name, then records `implementing`, `testing`, and `complete`. A failed task remains WIP on its branch.
 
 ## Configuration
 
@@ -82,8 +94,8 @@ Section names and task states are exact. Each task moves `Pending -> WIP -> Done
 | `TOKENSHARE_AGENT_COMMAND` | `codex --full-auto` | Native agent TUI command |
 | `TOKENSHARE_AGENT` | unset | Agent stub name or executable path |
 | `TOKENSHARE_POLL_SECONDS` | `60` | Monitor interval |
-| `TOKENSHARE_AUTO_PUSH` | unset | Set to `1`, `true`, or `yes` to pre-approve successful pushes |
 | `TOKENSHARE_AUTO_ATTACH` | unset | Current terminal or explicit TTY for automatic agent attachment |
+| `TOKENSHARE_STATE` | `~/.config/tokenshare/state.json` | Local branch publication and decline state |
 
 Command-line flags override environment variables. Run `python scripts/tokenshare-controller.py --help` for all options.
 

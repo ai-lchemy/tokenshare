@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,10 +23,6 @@ class TokenshareError(RuntimeError):
     """A user-actionable controller error."""
 
 
-class PushNotApproved(TokenshareError):
-    """A successful local result which was intentionally not published."""
-
-
 class AttachmentError(TokenshareError):
     """A non-retryable failure involving the requested attachment terminal."""
 
@@ -37,6 +34,21 @@ class Task:
     body: str
     start: int
     end: int
+
+
+@dataclasses.dataclass(frozen=True)
+class TasklistConfig:
+    allow_multiple_branches: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class ManagedBranch:
+    name: str
+    task_id: str
+    title: str
+    state: str
+    status_path: Path
+    head: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,6 +67,11 @@ SECTION_FOR_STATE = {
     "WIP": "WIP Tasks",
     "Done": "Completed Tasks",
 }
+BRANCH_PREFIX = "tokenshare-dev-"
+STATUS_TASK_ID = re.compile(r"^- Task-ID:\s*([0-9a-f]{64})\s*$", re.MULTILINE)
+STATUS_TASK = re.compile(r"^- Task:\s*(.+?)\s*$", re.MULTILINE)
+STATUS_BRANCH = re.compile(r"^- Branch:\s*(.+?)\s*$", re.MULTILINE)
+STATUS_STATE = re.compile(r"^- State:\s*(implementing|testing|complete|failed)\s*$", re.MULTILINE)
 
 
 class Dashboard:
@@ -215,14 +232,16 @@ def sync_repo(url: str, workspace: Path) -> Path:
     if destination.exists():
         if not (destination / ".git").exists():
             raise TokenshareError(f"Clone destination exists but is not a Git repo: {destination}")
-        ensure_clean(destination)
+        dirty = run(["git", "status", "--porcelain"], cwd=destination).stdout.strip()
+        branch = run(["git", "branch", "--show-current"], cwd=destination).stdout.strip()
+        if dirty and not branch.startswith(BRANCH_PREFIX):
+            raise TokenshareError(f"Refusing to update dirty checkout {destination}:\n{dirty}")
         configured = run(["git", "remote", "get-url", "origin"], cwd=destination).stdout.strip()
         if configured != url:
             raise TokenshareError(
                 f"Origin mismatch for {destination}: configured {configured!r}, expected {url!r}"
             )
         run(["git", "fetch", "--prune", "origin"], cwd=destination)
-        run(["git", "pull", "--ff-only"], cwd=destination)
     else:
         result = run(["git", "clone", "--", url, str(destination)], check=False)
         if result.returncode:
@@ -307,7 +326,195 @@ def parse_tasks(text: str) -> list[Task]:
             )
         )
         cursor = block_end
+    titles = [task.title for task in tasks]
+    duplicates = sorted({title for title in titles if titles.count(title) > 1})
+    if duplicates:
+        raise TokenshareError(f"Duplicate task title(s): {', '.join(duplicates)}")
     return tasks
+
+
+def parse_tasklist_config(text: str) -> TasklistConfig:
+    headings = list(re.finditer(r"^##\s+(.+?)\s*$", text, re.MULTILINE))
+    matches = [(index, heading) for index, heading in enumerate(headings)
+               if heading.group(1) == "Configuration"]
+    if not matches:
+        return TasklistConfig()
+    if len(matches) > 1:
+        raise TokenshareError("Tasklist has duplicate ## Configuration sections")
+    index, heading = matches[0]
+    end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+    values: dict[str, bool] = {}
+    for raw_line in text[heading.end():end].splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("<!--"):
+            continue
+        match = re.fullmatch(r"([a-z0-9-]+)\s*:\s*(true|false)", line)
+        if not match:
+            raise TokenshareError(f"Malformed Tokenshare configuration line: {line!r}")
+        key, raw_value = match.groups()
+        if key != "allow-multiple-branches":
+            raise TokenshareError(f"Unknown Tokenshare configuration key: {key}")
+        if key in values:
+            raise TokenshareError(f"Duplicate Tokenshare configuration key: {key}")
+        values[key] = raw_value == "true"
+    return TasklistConfig(values.get("allow-multiple-branches", False))
+
+
+def task_fingerprint(task: Task) -> str:
+    body = re.sub(
+        r"^(###\s+<task>\s+)\[(?:Pending|WIP|Done)\]",
+        r"\1",
+        task.body.replace("\r\n", "\n").strip(),
+        count=1,
+    )
+    canonical = f"{task.title.strip()}\n{body}\n"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def task_branch_name(task: Task) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", task.title.lower()).strip("-")[:48] or "task"
+    return f"{BRANCH_PREFIX}{slug}-{task_fingerprint(task)[:8]}"
+
+
+def default_branch(repo: Path) -> str:
+    result = run(
+        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        cwd=repo,
+        check=False,
+    )
+    if result.returncode or not result.stdout.strip().startswith("origin/"):
+        raise TokenshareError(f"Cannot determine the remote default branch for {repo}")
+    return result.stdout.strip().removeprefix("origin/")
+
+
+def switch_to_default(repo: Path) -> str:
+    ensure_clean(repo)
+    branch = default_branch(repo)
+    local = run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+                cwd=repo, check=False)
+    if local.returncode == 0:
+        run(["git", "switch", branch], cwd=repo)
+        run(["git", "merge", "--ff-only", f"origin/{branch}"], cwd=repo)
+    else:
+        run(["git", "switch", "-c", branch, "--track", f"origin/{branch}"], cwd=repo)
+    return branch
+
+
+def load_state(path: Path) -> dict:
+    if not path.is_file():
+        return {"version": 1, "repositories": {}}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TokenshareError(f"Cannot read Tokenshare state {path}: {exc}") from exc
+    if not isinstance(state, dict) or state.get("version") != 1:
+        raise TokenshareError(f"Unsupported Tokenshare state format in {path}")
+    state.setdefault("repositories", {})
+    return state
+
+
+def save_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def repository_state(state: dict, repo: Path) -> dict:
+    origin = run(["git", "remote", "get-url", "origin"], cwd=repo).stdout.strip()
+    return state.setdefault("repositories", {}).setdefault(origin, {})
+
+
+def remember_branch(
+    state: dict, state_path: Path, repo: Path, task: Task, branch: str, head: str
+) -> None:
+    repository_state(state, repo)[task_fingerprint(task)] = {
+        "branch": branch,
+        "head": head,
+        "title": task.title,
+        "status": "published",
+    }
+    save_state(state_path, state)
+
+
+def remote_managed_branches(repo: Path) -> list[ManagedBranch]:
+    refs = run(
+        ["git", "for-each-ref", "--format=%(refname:short) %(objectname)",
+         "refs/remotes/origin"],
+        cwd=repo,
+    ).stdout.splitlines()
+    records: list[ManagedBranch] = []
+    for line in refs:
+        if not line.strip():
+            continue
+        ref, head = line.split(maxsplit=1)
+        branch = ref.removeprefix("origin/")
+        if not branch.startswith(BRANCH_PREFIX):
+            continue
+        paths = run(
+            ["git", "ls-tree", "-r", "--name-only", ref, "--", "docs"], cwd=repo
+        ).stdout.splitlines()
+        for raw_path in reversed(sorted(paths)):
+            if not re.fullmatch(r"docs/status_.*\.md", raw_path):
+                continue
+            content = run(["git", "show", f"{ref}:{raw_path}"], cwd=repo).stdout
+            id_match = STATUS_TASK_ID.search(content)
+            title_match = STATUS_TASK.search(content)
+            branch_match = STATUS_BRANCH.search(content)
+            states = STATUS_STATE.findall(content)
+            if not (id_match and title_match and branch_match and states):
+                continue
+            if branch_match.group(1) != branch:
+                continue
+            records.append(
+                ManagedBranch(
+                    branch, id_match.group(1), title_match.group(1), states[-1],
+                    repo / raw_path, head,
+                )
+            )
+            break
+    return records
+
+
+def branch_is_merged(repo: Path, record: ManagedBranch, tasks: Sequence[Task]) -> bool:
+    matching = next((task for task in tasks if task.title == record.title), None)
+    if matching is not None and matching.state == "Done":
+        return True
+    base = default_branch(repo)
+    result = run(
+        ["git", "merge-base", "--is-ancestor", record.head, f"origin/{base}"],
+        cwd=repo,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def reconcile_deleted_branches(
+    state: dict,
+    state_path: Path,
+    repo: Path,
+    remote: Sequence[ManagedBranch],
+    tasks: Sequence[Task],
+) -> None:
+    current = {record.name for record in remote}
+    changed = False
+    for task_id, entry in repository_state(state, repo).items():
+        if entry.get("status") != "published" or entry.get("branch") in current:
+            continue
+        matching = next((task for task in tasks if task.title == entry.get("title")), None)
+        head = entry.get("head", "")
+        merged = matching is not None and matching.state == "Done"
+        if not merged and head:
+            merged = run(
+                ["git", "merge-base", "--is-ancestor", head,
+                 f"origin/{default_branch(repo)}"], cwd=repo, check=False
+            ).returncode == 0
+        entry["status"] = "merged" if merged else "declined"
+        changed = True
+        log(f"Task branch {entry['branch']} was {'merged' if merged else 'deleted without merge'}")
+    if changed:
+        save_state(state_path, state)
 
 
 def transition_task(text: str, task: Task, target_state: str) -> str:
@@ -331,13 +538,23 @@ def transition_task(text: str, task: Task, target_state: str) -> str:
     return prefix + updated + ("\n" if suffix else "") + suffix
 
 
-def write_status(path: Path, task: Task, state: str, note: str = "") -> None:
+def write_status(
+    path: Path,
+    task: Task,
+    state: str,
+    note: str = "",
+    *,
+    task_id: str | None = None,
+    branch: str | None = None,
+) -> None:
     if state not in {"implementing", "testing", "complete", "failed"}:
         raise ValueError(state)
     path.parent.mkdir(parents=True, exist_ok=True)
     now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     existing = path.read_text(encoding="utf-8") if path.exists() else (
         f"# Tokenshare Task Status\n\n- Task: {task.title}\n"
+        f"- Task-ID: {task_id or task_fingerprint(task)}\n"
+        f"- Branch: {branch or task_branch_name(task)}\n"
     )
     entry = f"\n## {now}\n\n- State: {state}\n"
     if note:
@@ -362,11 +579,11 @@ def git_commit_push(repo: Path, paths: Iterable[Path], message: str) -> None:
     if staged.returncode != 1:
         raise TokenshareError(f"Unable to inspect staged changes in {repo}")
     run(["git", "commit", "--only", "-m", message, "--", *relative], cwd=repo)
-    run(["git", "push"], cwd=repo)
+    run(["git", "push", "-u", "origin", "HEAD"], cwd=repo)
 
 
 def git_commit_all(repo: Path, message: str) -> bool:
-    """Commit the complete successful task result without publishing it."""
+    """Commit the complete successful task result."""
     run(["git", "add", "--all"], cwd=repo)
     staged = run(["git", "diff", "--cached", "--quiet"], cwd=repo, check=False)
     if staged.returncode == 0:
@@ -375,22 +592,6 @@ def git_commit_all(repo: Path, message: str) -> bool:
         raise TokenshareError(f"Unable to inspect staged changes in {repo}")
     run(["git", "commit", "-m", message], cwd=repo)
     return True
-
-
-def approve_push(repo: Path, task: Task, *, auto_push: bool) -> bool:
-    if auto_push:
-        log(f"Auto-push approved for {repo.name}: {task.title}")
-        return True
-    prompt = f"Push successful task changes for {repo.name} ({task.title})? [y/N] "
-    try:
-        with open("/dev/tty", "r+", encoding="utf-8") as terminal:
-            terminal.write(prompt)
-            terminal.flush()
-            answer = terminal.readline()
-    except OSError:
-        log("Push approval required, but no interactive terminal is available")
-        return False
-    return answer.strip().lower() in {"y", "yes"}
 
 
 def agent_prompt(task: Task, status_path: Path, phase: str) -> str:
@@ -822,39 +1023,118 @@ def status_filename(repo: Path) -> Path:
 
 def process_task(
     repo: Path,
-    tasklist: Path,
     task: Task,
     agent_command: str,
     *,
+    state: dict,
+    state_path: Path,
+    existing: ManagedBranch | None = None,
     use_tmux: bool = True,
-    auto_push: bool = False,
     auto_attach: AttachTarget | None = None,
 ) -> None:
     DASHBOARD.set_task(repo, task.title)
-    log(f"Claiming {repo.name}: {task.title}")
-    status_path = status_filename(repo)
-    write_status(status_path, task, "implementing")
-    text = tasklist.read_text(encoding="utf-8")
-    tasklist.write_text(transition_task(text, task, "WIP"), encoding="utf-8")
-    git_commit_push(repo, [tasklist, status_path], f"tokenshare: claim {task.title}")
+    branch = existing.name if existing else task_branch_name(task)
+    task_id = existing.task_id if existing else task_fingerprint(task)
+    if existing:
+        log(f"Resuming {repo.name}: {task.title} on {branch}")
+        current = run(["git", "branch", "--show-current"], cwd=repo).stdout.strip()
+        dirty = run(["git", "status", "--porcelain"], cwd=repo).stdout.strip()
+        if dirty and current != branch:
+            raise TokenshareError(
+                f"Refusing to switch away from dirty branch {current!r} in {repo}"
+            )
+        if current != branch:
+            ensure_clean(repo)
+            local = run(
+                ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+                cwd=repo,
+                check=False,
+            )
+            if local.returncode == 0:
+                run(["git", "switch", branch], cwd=repo)
+            else:
+                run(["git", "switch", "-c", branch, "--track", f"origin/{branch}"], cwd=repo)
+        if dirty:
+            remote_is_ancestor = run(
+                ["git", "merge-base", "--is-ancestor", f"origin/{branch}", "HEAD"],
+                cwd=repo,
+                check=False,
+            )
+            if remote_is_ancestor.returncode != 0:
+                raise TokenshareError(
+                    f"Managed branch {branch} has remote changes and local uncommitted work"
+                )
+        else:
+            run(["git", "merge", "--ff-only", f"origin/{branch}"], cwd=repo)
+        tasklist = find_tasklist(repo)
+        branch_tasks = parse_tasks(tasklist.read_text(encoding="utf-8"))
+        wip_task = next(
+            (item for item in branch_tasks if item.title == task.title and item.state == "WIP"),
+            None,
+        )
+        if wip_task is None:
+            if any(item.title == task.title and item.state == "Done" for item in branch_tasks):
+                completed_task = next(item for item in branch_tasks if item.title == task.title)
+                if run(["git", "status", "--porcelain"], cwd=repo).stdout.strip():
+                    write_status(
+                        status_path, completed_task, "complete",
+                        task_id=task_id, branch=branch,
+                    )
+                    git_commit_all(repo, f"tokenshare: complete {task.title}")
+                run(["git", "push", "-u", "origin", "HEAD"], cwd=repo)
+                head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+                remember_branch(
+                    state, state_path, repo, completed_task, branch, head
+                )
+                log(f"Task branch already complete: {branch}")
+                DASHBOARD.set_task(None)
+                return
+            raise TokenshareError(f"Managed branch {branch} has no WIP task {task.title!r}")
+        status_path = existing.status_path
+    else:
+        log(f"Claiming {repo.name}: {task.title} on {branch}")
+        ensure_clean(repo)
+        base = default_branch(repo)
+        run(["git", "switch", "-c", branch, f"origin/{base}"], cwd=repo)
+        tasklist = find_tasklist(repo)
+        task = next(
+            item for item in parse_tasks(tasklist.read_text(encoding="utf-8"))
+            if item.title == task.title and item.state == "Pending"
+        )
+        status_path = status_filename(repo)
+        write_status(
+            status_path, task, "implementing", task_id=task_id, branch=branch
+        )
+        text = tasklist.read_text(encoding="utf-8")
+        tasklist.write_text(transition_task(text, task, "WIP"), encoding="utf-8")
+        git_commit_push(repo, [tasklist, status_path], f"tokenshare: claim {task.title}")
+        head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+        remember_branch(state, state_path, repo, task, branch, head)
+        wip_task = next(
+            item for item in parse_tasks(tasklist.read_text(encoding="utf-8"))
+            if item.state == "WIP" and item.title == task.title
+        )
 
-    wip_task = next(
-        item
-        for item in parse_tasks(tasklist.read_text(encoding="utf-8"))
-        if item.state == "WIP" and item.title == task.title
-    )
     try:
-        run_agent(
-            repo, agent_command, wip_task, status_path, "implementing",
-            use_tmux=use_tmux, auto_attach=auto_attach,
+        status_text = status_path.read_text(encoding="utf-8")
+        if phase_completion_marker("implementing") not in status_text:
+            run_agent(
+                repo, agent_command, wip_task, status_path, "implementing",
+                use_tmux=use_tmux, auto_attach=auto_attach,
+            )
+            status_text = status_path.read_text(encoding="utf-8")
+        if "- State: testing" not in status_text:
+            write_status(status_path, wip_task, "testing", task_id=task_id, branch=branch)
+            git_commit_push(repo, [status_path], f"tokenshare: test {task.title}")
+            status_text = status_path.read_text(encoding="utf-8")
+        if phase_completion_marker("testing") not in status_text:
+            run_agent(
+                repo, agent_command, wip_task, status_path, "testing",
+                use_tmux=use_tmux, auto_attach=auto_attach,
+            )
+        write_status(
+            status_path, wip_task, "complete", task_id=task_id, branch=branch
         )
-        write_status(status_path, wip_task, "testing")
-        git_commit_push(repo, [status_path], f"tokenshare: test {task.title}")
-        run_agent(
-            repo, agent_command, wip_task, status_path, "testing",
-            use_tmux=use_tmux, auto_attach=auto_attach,
-        )
-        write_status(status_path, wip_task, "complete")
         current = tasklist.read_text(encoding="utf-8")
         refreshed = next(
             item
@@ -863,22 +1143,19 @@ def process_task(
         )
         tasklist.write_text(transition_task(current, refreshed, "Done"), encoding="utf-8")
         git_commit_all(repo, f"tokenshare: complete {task.title}")
-        if not approve_push(repo, task, auto_push=auto_push):
-            raise PushNotApproved(
-                f"Push not approved; successful changes remain committed locally in {repo}. "
-                f"Publish them with: git -C {shlex.quote(str(repo))} push"
-            )
-        run(["git", "push"], cwd=repo)
-    except PushNotApproved:
-        raise
+        run(["git", "push", "-u", "origin", "HEAD"], cwd=repo)
+        head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+        remember_branch(state, state_path, repo, task, branch, head)
     except Exception as exc:
-        write_status(status_path, wip_task, "failed", str(exc))
+        write_status(
+            status_path, wip_task, "failed", str(exc), task_id=task_id, branch=branch
+        )
         try:
             git_commit_push(repo, [status_path], f"tokenshare: record failure for {task.title}")
         except Exception as record_error:
             log(f"Could not push failure status: {record_error}")
         raise
-    log(f"Completed {repo.name}: {task.title}")
+    log(f"Completed {repo.name}: {task.title}; review branch {branch}")
     DASHBOARD.set_task(None)
 
 
@@ -886,41 +1163,108 @@ def scan_repositories(
     repos: Sequence[Path],
     agent_command: str,
     *,
+    state: dict,
+    state_path: Path,
     use_tmux: bool = True,
-    auto_push: bool = False,
     auto_attach: AttachTarget | None = None,
 ) -> int:
-    tasklists = [(repo, find_tasklist(repo)) for repo in repos]
     completed = 0
     while True:
-        parsed = [
-            (repo, tasklist, parse_tasks(tasklist.read_text(encoding="utf-8")))
-            for repo, tasklist in tasklists
-        ]
-        wip = [
-            (repo, task) for repo, _, tasks in parsed for task in tasks if task.state == "WIP"
-        ]
-        if wip:
-            names = ", ".join(f"{repo.name}: {task.title}" for repo, task in wip)
-            raise TokenshareError(
-                f"Existing WIP task(s) require attention before continuing: {names}"
+        progressed = False
+        for repo in repos:
+            current_branch = run(["git", "branch", "--show-current"], cwd=repo).stdout.strip()
+            dirty = run(["git", "status", "--porcelain"], cwd=repo).stdout.strip()
+            remote = remote_managed_branches(repo)
+            if dirty and current_branch.startswith(BRANCH_PREFIX):
+                record = next((item for item in remote if item.name == current_branch), None)
+                if record is None:
+                    raise TokenshareError(
+                        f"Dirty managed branch {current_branch} has not been published"
+                    )
+                branch_tasklist = find_tasklist(repo)
+                branch_task = next(
+                    item for item in parse_tasks(branch_tasklist.read_text(encoding="utf-8"))
+                    if item.title == record.title
+                )
+                process_task(
+                    repo, branch_task, agent_command, state=state, state_path=state_path,
+                    existing=record, use_tmux=use_tmux, auto_attach=auto_attach,
+                )
+                completed += 1
+                progressed = True
+                break
+
+            switch_to_default(repo)
+            tasklist = find_tasklist(repo)
+            text = tasklist.read_text(encoding="utf-8")
+            tasks = parse_tasks(text)
+            config = parse_tasklist_config(text)
+            wip = [task for task in tasks if task.state == "WIP"]
+            if wip:
+                names = ", ".join(task.title for task in wip)
+                raise TokenshareError(f"Default branch contains WIP task(s): {names}")
+
+            for record in remote:
+                repository_state(state, repo)[record.task_id] = {
+                    "branch": record.name,
+                    "head": record.head,
+                    "title": record.title,
+                    "status": "published",
+                }
+            if remote:
+                save_state(state_path, state)
+            reconcile_deleted_branches(state, state_path, repo, remote, tasks)
+            active = [record for record in remote if not branch_is_merged(repo, record, tasks)]
+
+            revised_titles = {
+                record.title for record in active
+                if any(task.title == record.title and task_fingerprint(task) != record.task_id
+                       for task in tasks)
+            }
+            if revised_titles:
+                log(
+                    f"Revised task blocked in {repo.name} until its earlier branch is resolved: "
+                    + ", ".join(sorted(revised_titles))
+                )
+                continue
+
+            incomplete = next((record for record in active if record.state != "complete"), None)
+            if incomplete:
+                branch_task = next(
+                    task for task in tasks
+                    if task.title == incomplete.title
+                )
+                process_task(
+                    repo, branch_task, agent_command, state=state, state_path=state_path,
+                    existing=incomplete, use_tmux=use_tmux, auto_attach=auto_attach,
+                )
+                completed += 1
+                progressed = True
+                break
+            if active and not config.allow_multiple_branches:
+                continue
+
+            active_ids = {record.task_id for record in active}
+            declined = {
+                task_id for task_id, entry in repository_state(state, repo).items()
+                if entry.get("status") == "declined"
+            }
+            pending = next(
+                (task for task in tasks if task.state == "Pending"
+                 and task_fingerprint(task) not in active_ids | declined),
+                None,
             )
-        pending = next(
-            (
-                (repo, tasklist, task)
-                for repo, tasklist, tasks in parsed
-                for task in tasks
-                if task.state == "Pending"
-            ),
-            None,
-        )
-        if pending is None:
+            if pending is None:
+                continue
+            process_task(
+                repo, pending, agent_command, state=state, state_path=state_path,
+                use_tmux=use_tmux, auto_attach=auto_attach,
+            )
+            completed += 1
+            progressed = True
+            break
+        if not progressed:
             return completed
-        process_task(
-            *pending, agent_command, use_tmux=use_tmux, auto_push=auto_push,
-            auto_attach=auto_attach,
-        )
-        completed += 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -995,12 +1339,6 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TTY",
         help="Attach agent TUIs to the current terminal or an optional TTY path",
     )
-    parser.add_argument(
-        "--auto-push",
-        action="store_true",
-        default=os.environ.get("TOKENSHARE_AUTO_PUSH", "").lower() in {"1", "true", "yes"},
-        help="Pre-approve publishing coding changes after successful testing",
-    )
     return parser
 
 
@@ -1012,6 +1350,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise TokenshareError("--auto-attach cannot be used with --no-tmux")
     auto_attach = resolve_attach_target(args.auto_attach)
     agent_command = resolve_agent_command(args.agent, args.agent_command)
+    state_path = Path(
+        os.environ.get(
+            "TOKENSHARE_STATE",
+            Path.home() / ".config" / "tokenshare" / "state.json",
+        )
+    ).expanduser()
+    state = load_state(state_path)
     urls = read_repo_urls(args.config.expanduser().resolve())
     names = [repo_name(url) for url in urls]
     if len(names) != len(set(names)):
@@ -1025,8 +1370,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         completed = scan_repositories(
             repos,
             agent_command,
+            state=state,
+            state_path=state_path,
             use_tmux=not args.no_tmux,
-            auto_push=args.auto_push,
             auto_attach=auto_attach,
         )
         if args.once:

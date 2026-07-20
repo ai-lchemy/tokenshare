@@ -49,7 +49,6 @@ class TaskParsingTests(unittest.TestCase):
         self.assertEqual(args.agent_command, "codex --full-auto")
         self.assertIsNone(args.agent)
         self.assertFalse(args.no_tmux)
-        self.assertFalse(args.auto_push)
         self.assertIsNone(args.auto_attach)
 
     def test_installed_defaults_come_from_install_metadata(self):
@@ -230,11 +229,34 @@ class TaskParsingTests(unittest.TestCase):
         self.assertIn(controller.phase_completion_marker("implementing"), prompt)
         self.assertNotIn(controller.phase_completion_marker("testing"), prompt)
 
-    def test_push_requires_approval_unless_preapproved(self):
+    def test_task_branch_name_is_readable_stable_and_collision_resistant(self):
         task = controller.parse_tasks(TASKLIST)[0]
-        with mock.patch("builtins.open", side_effect=OSError):
-            self.assertFalse(controller.approve_push(Path("repo"), task, auto_push=False))
-        self.assertTrue(controller.approve_push(Path("repo"), task, auto_push=True))
+        branch = controller.task_branch_name(task)
+        self.assertRegex(branch, r"^tokenshare-dev-implement-awesome-feature-[0-9a-f]{8}$")
+        moved = controller.transition_task(TASKLIST, task, "WIP")
+        self.assertEqual(
+            controller.task_fingerprint(task),
+            controller.task_fingerprint(controller.parse_tasks(moved)[0]),
+        )
+
+    def test_tasklist_configuration_is_strict_and_defaults_to_one_branch(self):
+        self.assertFalse(controller.parse_tasklist_config(TASKLIST).allow_multiple_branches)
+        configured = TASKLIST.replace(
+            "## Pending Tasks",
+            "## Configuration\nallow-multiple-branches: true\n## Pending Tasks",
+        )
+        self.assertTrue(
+            controller.parse_tasklist_config(configured).allow_multiple_branches
+        )
+        with self.assertRaisesRegex(controller.TokenshareError, "Unknown"):
+            controller.parse_tasklist_config(
+                configured.replace("allow-multiple-branches", "unknown-setting")
+            )
+
+    def test_rejects_duplicate_task_titles(self):
+        duplicate = TWO_TASKS.replace("Implement Another Feature", "Implement Awesome Feature")
+        with self.assertRaisesRegex(controller.TokenshareError, "Duplicate task title"):
+            controller.parse_tasks(duplicate)
 
     def test_parses_and_moves_task_between_sections(self):
         tasks = controller.parse_tasks(TASKLIST)
@@ -300,7 +322,11 @@ class ControllerIntegrationTests(unittest.TestCase):
             self.git("init", cwd=seed)
             self.git("config", "user.name", "Tokenshare Test", cwd=seed)
             self.git("config", "user.email", "tokenshare@example.invalid", cwd=seed)
-            (seed / "tokenshare_tasklist.md").write_text(TWO_TASKS, encoding="utf-8")
+            multiple = TWO_TASKS.replace(
+                "## Pending Tasks",
+                "## Configuration\nallow-multiple-branches: true\n## Pending Tasks",
+            )
+            (seed / "tokenshare_tasklist.md").write_text(multiple, encoding="utf-8")
             self.git("add", ".", cwd=seed)
             self.git("commit", "-m", "seed", cwd=seed)
             self.git("init", "--bare", str(remote))
@@ -324,6 +350,7 @@ class ControllerIntegrationTests(unittest.TestCase):
                     "GIT_AUTHOR_EMAIL": "tokenshare@example.invalid",
                     "GIT_COMMITTER_NAME": "Tokenshare Test",
                     "GIT_COMMITTER_EMAIL": "tokenshare@example.invalid",
+                    "TOKENSHARE_STATE": str(root / "state.json"),
                 }
             )
             previous = os.environ.copy()
@@ -335,7 +362,6 @@ class ControllerIntegrationTests(unittest.TestCase):
                         "--workspace", str(workspace),
                         "--agent-command", command,
                         "--no-tmux",
-                        "--auto-push",
                         "--once",
                     ]
                 )
@@ -344,21 +370,131 @@ class ControllerIntegrationTests(unittest.TestCase):
                 os.environ.update(previous)
             self.assertEqual(result, 0)
             checkout = workspace / "task-repo"
-            updated = (checkout / "tokenshare_tasklist.md").read_text(encoding="utf-8")
-            self.assertIn("[Done] Implement Awesome Feature", updated)
-            self.assertIn("[Done] Implement Another Feature", updated)
-            statuses = list((checkout / "docs").glob("status_*.md"))
-            self.assertEqual(len(statuses), 2)
-            for status in statuses:
-                status_text = status.read_text(encoding="utf-8")
-                self.assertIn("- State: implementing", status_text)
-                self.assertIn("- State: testing", status_text)
-                self.assertIn("- State: complete", status_text)
-            published = subprocess.run(
-                ["git", f"--git-dir={remote}", "show", "HEAD:agent-result.txt"],
+            default_text = subprocess.run(
+                ["git", f"--git-dir={remote}", "show", "HEAD:tokenshare_tasklist.md"],
                 check=True, stdout=subprocess.PIPE, text=True,
+            ).stdout
+            self.assertEqual(default_text, multiple)
+            branches = subprocess.run(
+                ["git", f"--git-dir={remote}", "for-each-ref", "--format=%(refname:short)",
+                 "refs/heads"],
+                check=True, stdout=subprocess.PIPE, text=True,
+            ).stdout.splitlines()
+            branches = [branch for branch in branches if branch.startswith("tokenshare-dev-")]
+            self.assertEqual(len(branches), 2)
+            for branch in branches:
+                completed_text = subprocess.run(
+                    ["git", f"--git-dir={remote}", "show", f"{branch}:tokenshare_tasklist.md"],
+                    check=True, stdout=subprocess.PIPE, text=True,
+                ).stdout
+                self.assertIn("[Done]", completed_text)
+                published = subprocess.run(
+                    ["git", f"--git-dir={remote}", "show", f"{branch}:agent-result.txt"],
+                    check=True, stdout=subprocess.PIPE, text=True,
+                )
+                self.assertEqual(published.stdout, "ok\n")
+
+    def test_default_stops_after_one_outstanding_task_branch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seed = root / "seed"
+            remote = root / "task-repo.git"
+            workspace = root / "workspace"
+            seed.mkdir()
+            self.git("init", cwd=seed)
+            self.git("config", "user.name", "Tokenshare Test", cwd=seed)
+            self.git("config", "user.email", "tokenshare@example.invalid", cwd=seed)
+            (seed / "tokenshare_tasklist.md").write_text(TWO_TASKS, encoding="utf-8")
+            self.git("add", ".", cwd=seed)
+            self.git("commit", "-m", "seed", cwd=seed)
+            self.git("init", "--bare", str(remote))
+            self.git("remote", "add", "origin", str(remote), cwd=seed)
+            self.git("push", "-u", "origin", "HEAD", cwd=seed)
+
+            fake_agent = root / "fake_agent.py"
+            fake_agent.write_text("import sys\nsys.stdin.read()\n", encoding="utf-8")
+            config = root / "task_repos.md"
+            config.write_text(f"{remote}\n", encoding="utf-8")
+            command = f'"{sys.executable}" "{fake_agent}"'
+            environment = {
+                "GIT_AUTHOR_NAME": "Tokenshare Test",
+                "GIT_AUTHOR_EMAIL": "tokenshare@example.invalid",
+                "GIT_COMMITTER_NAME": "Tokenshare Test",
+                "GIT_COMMITTER_EMAIL": "tokenshare@example.invalid",
+                "TOKENSHARE_STATE": str(root / "state.json"),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                result = controller.main(
+                    [
+                        "--config", str(config),
+                        "--workspace", str(workspace),
+                        "--agent-command", command,
+                        "--no-tmux",
+                        "--once",
+                    ]
+                )
+            self.assertEqual(result, 0)
+            branches = subprocess.run(
+                ["git", f"--git-dir={remote}", "for-each-ref", "--format=%(refname:short)",
+                 "refs/heads"],
+                check=True, stdout=subprocess.PIPE, text=True,
+            ).stdout.splitlines()
+            managed = [branch for branch in branches if branch.startswith("tokenshare-dev-")]
+            self.assertEqual(len(managed), 1)
+            default_text = subprocess.run(
+                ["git", f"--git-dir={remote}", "show", "HEAD:tokenshare_tasklist.md"],
+                check=True, stdout=subprocess.PIPE, text=True,
+            ).stdout
+            self.assertEqual(default_text, TWO_TASKS)
+
+            fresh_environment = dict(environment)
+            fresh_environment["TOKENSHARE_STATE"] = str(root / "fresh-state.json")
+            with mock.patch.dict(os.environ, fresh_environment, clear=False):
+                fresh_result = controller.main(
+                    [
+                        "--config", str(config),
+                        "--workspace", str(root / "fresh-workspace"),
+                        "--agent-command", command,
+                        "--no-tmux",
+                        "--once",
+                    ]
+                )
+            self.assertEqual(fresh_result, 0)
+            fresh_branches = subprocess.run(
+                ["git", f"--git-dir={remote}", "for-each-ref", "--format=%(refname:short)",
+                 "refs/heads"],
+                check=True, stdout=subprocess.PIPE, text=True,
+            ).stdout.splitlines()
+            self.assertEqual(
+                len([branch for branch in fresh_branches if branch.startswith("tokenshare-dev-")]),
+                1,
             )
-            self.assertEqual(published.stdout, "ok\n")
+
+            self.git("update-ref", "-d", f"refs/heads/{managed[0]}", cwd=remote)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                second = controller.main(
+                    [
+                        "--config", str(config),
+                        "--workspace", str(workspace),
+                        "--agent-command", command,
+                        "--no-tmux",
+                        "--once",
+                    ]
+                )
+            self.assertEqual(second, 0)
+            remaining = subprocess.run(
+                ["git", f"--git-dir={remote}", "for-each-ref", "--format=%(refname:short)",
+                 "refs/heads"],
+                check=True, stdout=subprocess.PIPE, text=True,
+            ).stdout.splitlines()
+            remaining_managed = [
+                branch for branch in remaining if branch.startswith("tokenshare-dev-")
+            ]
+            self.assertEqual(len(remaining_managed), 1)
+            self.assertNotEqual(remaining_managed[0], managed[0])
+            state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+            entries = next(iter(state["repositories"].values()))
+            self.assertIn("declined", {entry["status"] for entry in entries.values()})
 
 
 if __name__ == "__main__":

@@ -27,9 +27,11 @@ Use `--once` to clone/synchronize all repositories, drain the currently pending 
 
 ## Task contract
 
-For each task, claim it by moving it from Pending to WIP, maintain `docs/status_YYYY-MM-DD_HH-MM-SS.md` through `implementing`, `testing`, and `complete`, and move it to Done only after the coding agent succeeds. Work on only one task at a time. Leave failed work in WIP and report the error.
+For each task, create a deterministic `tokenshare-dev-<task-title>-<fingerprint>` branch from the remote default branch. Claim it by moving it from Pending to WIP on that branch, maintain `docs/status_YYYY-MM-DD_HH-MM-SS.md` through `implementing`, `testing`, and `complete`, and move it to Done only after the coding agent succeeds. Push each lifecycle checkpoint to the task branch and never push, merge, or delete the remote default branch.
 
-The coding agent must inspect repository instructions, implement the entire task, and run appropriate tests. It leaves changes uncommitted and must not push; the controller commits only after successful implementation and testing, then requests user approval before pushing. Use `--auto-push` only when publication has been pre-approved. The agent must not ask questions; when details are absent, make the smallest reasonable assumption and record it in the status file.
+The coding agent must inspect repository instructions, implement the entire task, and run appropriate tests. It leaves changes uncommitted and must not push; the controller owns commits and automatically publishes the task branch. Maintainers review and merge that branch themselves. The agent must not ask questions; when details are absent, make the smallest reasonable assumption and record it in the status file.
+
+Allow only one outstanding task branch per repository by default. A tasklist may opt into sequential creation of multiple outstanding branches with a strict `## Configuration` section containing `allow-multiple-branches: true`. Resume incomplete managed branches before claiming new work. Treat a deleted-unmerged branch as declined locally and skip the exact task fingerprint until its body changes.
 
 When a child agent exits unsuccessfully, retry indefinitely with a 5-second incremental backoff and continue the provider's latest repository session where supported. Do not fail the task merely because of transient capacity, rate-limit, usage-limit, or network errors.
 
@@ -41,6 +43,7 @@ Use `--auto-attach [TTY]` when the user wants each agent TUI shown automatically
 
 - Stop if a configured repository cannot be accessed.
 - Stop if both root and `docs/` tasklists exist.
-- Refuse a new Pending task while any WIP task exists.
+- Refuse WIP tasks on the remote default branch and resume WIP tasks on managed branches.
+- Require unique task titles and block body revisions while the earlier task branch exists.
 - Do not mark a task Done after a nonzero agent exit.
 - Preserve unrelated working-tree changes and surface them as an error.
