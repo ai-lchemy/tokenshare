@@ -45,7 +45,7 @@ class Task:
 
 @dataclasses.dataclass
 class QueueTask:
-    number: int
+    number: int | None
     task_id: str
     state: str
     approval: str
@@ -476,7 +476,7 @@ def parse_queue(text: str) -> list[QueueTask]:
         block = text[match.start():block_end]
         metadata = dict(QUEUE_METADATA.findall(block))
         required = {
-            "Task-Number", "Task-ID", "Source-Repo", "Source-URL", "Author",
+            "Task-ID", "Source-Repo", "Source-URL", "Author",
             "Source-Commit", "Imported-At", "Branch",
         }
         missing = sorted(required - metadata.keys())
@@ -484,10 +484,17 @@ def parse_queue(text: str) -> list[QueueTask]:
             raise TokenshareError(
                 f"Local task {match.group(3)!r} missing metadata: {', '.join(missing)}"
             )
+        raw_number = metadata.get("Task-Number")
         try:
-            number = int(metadata["Task-Number"])
+            number = int(raw_number) if raw_number is not None else None
         except ValueError as exc:
             raise TokenshareError("Task-Number must be an integer") from exc
+        if (
+            match.group(1) == "Pending"
+            and match.group(2) == "Unapproved"
+            and number is None
+        ):
+            raise TokenshareError("Pending Unapproved tasks require Task-Number")
         tasks.append(QueueTask(
             number, metadata["Task-ID"], match.group(1), match.group(2),
             match.group(3).strip(), block, metadata["Source-Repo"],
@@ -495,19 +502,48 @@ def parse_queue(text: str) -> list[QueueTask]:
             metadata["Imported-At"], metadata["Branch"],
         ))
         cursor = block_end
-    numbers = [task.number for task in tasks]
+    numbers = [
+        task.number for task in tasks
+        if task.state == "Pending" and task.approval == "Unapproved"
+        and task.number is not None
+    ]
     if len(numbers) != len(set(numbers)):
         raise TokenshareError("Duplicate local task numbers")
     return tasks
 
 
+def normalize_queue_numbers(tasks: Sequence[QueueTask]) -> bool:
+    """Keep numbers temporary, contiguous, and exclusive to unapproved tasks."""
+    changed = False
+    next_number = 1
+    for task in tasks:
+        wanted = (
+            next_number
+            if task.state == "Pending" and task.approval == "Unapproved"
+            else None
+        )
+        if wanted is not None:
+            next_number += 1
+        if task.number != wanted:
+            task.number = wanted
+            changed = True
+    return changed
+
+
 def render_queue(tasks: Sequence[QueueTask]) -> str:
+    normalize_queue_numbers(tasks)
     lines = ["# Tokenshare Agent Tasklist", ""]
     for state, heading in (("Pending", "Pending Tasks"), ("WIP", "WIP Tasks"),
                            ("Done", "Completed Tasks")):
         lines.extend([f"## {heading}", ""])
-        for task in sorted((item for item in tasks if item.state == state),
-                           key=lambda item: item.number):
+        section_tasks = [item for item in tasks if item.state == state]
+        if state == "Pending":
+            section_tasks.sort(key=lambda item: (
+                item.approval != "Unapproved",
+                item.number if item.number is not None else 0,
+                item.imported_at,
+            ))
+        for task in section_tasks:
             original_lines = task.body.splitlines()
             body_start = next(
                 (index + 1 for index, line in enumerate(original_lines)
@@ -519,9 +555,12 @@ def render_queue(tasks: Sequence[QueueTask]) -> str:
                 payload = payload[:-1]
             if payload and payload[-1].strip() == "### </task>":
                 payload = payload[:-1]
-            lines.extend([
+            metadata_lines = [
                 f"### <task> [{task.state}] [{task.approval}] {task.title}",
-                f"- Task-Number: {task.number}",
+            ]
+            if task.number is not None:
+                metadata_lines.append(f"- Task-Number: {task.number}")
+            metadata_lines.extend([
                 f"- Task-ID: {task.task_id}",
                 f"- Source-Repo: {task.repo_name}",
                 f"- Source-URL: {task.repo_url}",
@@ -529,9 +568,8 @@ def render_queue(tasks: Sequence[QueueTask]) -> str:
                 f"- Source-Commit: {task.source_commit}",
                 f"- Imported-At: {task.imported_at}",
                 f"- Branch: {task.branch}",
-                *payload,
-                "### </task>", "",
             ])
+            lines.extend([*metadata_lines, *payload, "### </task>", ""])
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -547,6 +585,13 @@ def load_queue(path: Path) -> list[QueueTask]:
     if not path.exists():
         save_queue(path, [])
     return parse_queue(path.read_text(encoding="utf-8"))
+
+
+def migrate_queue(path: Path) -> list[QueueTask]:
+    tasks = load_queue(path)
+    if normalize_queue_numbers(tasks):
+        save_queue(path, tasks)
+    return tasks
 
 
 def queue_task_from_remote(
@@ -609,8 +654,10 @@ def approve_tasks(
 ) -> list[int]:
     with QUEUE_LOCK:
         tasks = load_queue(path)
+        normalize_queue_numbers(tasks)
         eligible = {task.number for task in tasks
-                    if task.state == "Pending" and task.approval == "Unapproved"}
+                    if task.state == "Pending" and task.approval == "Unapproved"
+                    and task.number is not None}
         selected = parse_approval_selector(expression, eligible)
         unknown = selected - eligible
         if unknown:
@@ -628,6 +675,8 @@ def approve_tasks(
                     else f"Task #{task.number} approved by local operator"
                 )
                 append_task_log(task_log_path(logs_dir, task.branch), event, note)
+                task.number = None
+        normalize_queue_numbers(tasks)
         save_queue(path, tasks)
     return sorted(selected)
 
@@ -691,13 +740,18 @@ def queued_task_author(path: Path | None, task_id: str) -> str:
 def format_queue_view(tasks: Sequence[QueueTask]) -> str:
     priority = {("Pending", "Unapproved"): 0, ("Pending", "Approved"): 1,
                 ("WIP", "Approved"): 2, ("Done", "Approved"): 3}
-    ordered = sorted(tasks, key=lambda task: (priority.get((task.state, task.approval), 9),
-                                              task.number))
+    normalize_queue_numbers(tasks)
+    ordered = sorted(tasks, key=lambda task: (
+        priority.get((task.state, task.approval), 9),
+        task.number if task.number is not None else 0,
+        task.imported_at,
+    ))
     header = "#  State    Approval    Repository          Author               Title"
     rows = [header, "-" * len(header)]
     for task in ordered:
+        number = str(task.number) if task.number is not None else ""
         rows.append(
-            f"{task.number:<3}{task.state:<9}{task.approval:<12}"
+            f"{number:<3}{task.state:<9}{task.approval:<12}"
             f"{task.repo_name[:18]:<20}{task.author[:19]:<21}{task.title}"
         )
     return "\n".join(rows) if ordered else "No tasks have been imported."
@@ -1423,6 +1477,7 @@ def intake_remote_tasks(
                         cwd=repo).stdout.strip()
     with QUEUE_LOCK:
         local = load_queue(path)
+        normalize_queue_numbers(local)
         source_state = state.setdefault("sources", {}).setdefault(source_url, {})
         previous_commit = source_state.get("last_inspected_commit")
         remote_changed = previous_commit != source_commit
@@ -1439,7 +1494,8 @@ def intake_remote_tasks(
                 revoked += 1
                 append_task_log(task_log_path(logs_dir, item.branch), "approval-revoked",
                                 "Remote Pending task was edited or removed")
-                log(f"Revoked stale task #{item.number}: {item.title}")
+                label = f"#{item.number}" if item.number is not None else item.task_id[:8]
+                log(f"Revoked stale task {label}: {item.title}")
             else:
                 retained.append(item)
         local = retained
@@ -1448,7 +1504,10 @@ def intake_remote_tasks(
         repo_data.pop("seen_task_ids", None)
         repo_data.pop("last_inspected_commit", None)
         seen = set(source_state.get("seen_task_ids", []))
-        next_number = int(state.get("next_task_number", 1))
+        next_number = 1 + sum(
+            item.state == "Pending" and item.approval == "Unapproved"
+            for item in local
+        )
         imported = 0
         for task in pending if remote_changed else []:
             task_id = task_fingerprint(task)
@@ -1481,7 +1540,7 @@ def intake_remote_tasks(
                 item.approval = "Approved"
                 append_task_log(task_log_path(logs_dir, item.branch), "managed-branch-recovered",
                                 f"Recovered {migrated_state} from origin/{record.name}")
-        state["next_task_number"] = next_number
+        state.pop("next_task_number", None)
         source_state["seen_task_ids"] = sorted(seen)
         source_state["last_inspected_commit"] = source_commit
         save_queue(path, local)
@@ -1880,6 +1939,8 @@ class ControllerRuntime:
             "TOKENSHARE_STATE", Path.home() / ".config" / "tokenshare" / "state.json"
         )).expanduser()
         self.state = load_state(self.state_path)
+        if self.state.pop("next_task_number", None) is not None:
+            save_state(self.state_path, self.state)
         self.urls = read_repo_urls(args.config.expanduser().resolve())
         names = [repo_name(url) for url in self.urls]
         if len(names) != len(set(names)):
@@ -2311,7 +2372,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         DASHBOARD.enabled = False
         CONTROLLER_LOG = controller_log_path(runtime.workspace)
-        load_queue(runtime.queue_file)
+        migrate_queue(runtime.queue_file)
         if args.dangerously_skip_approvals:
             warning = (
                 "DANGER: --dangerously-skip-approvals is enabled. Every imported task "

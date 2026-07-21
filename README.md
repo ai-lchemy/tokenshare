@@ -1,18 +1,29 @@
 # Tokenshare
 
-Tokenshare is a persistent Python controller and AIML skill that watches Git repositories for autonomous coding tasks. It clones configured repositories beneath a user-selected development directory and publishes completed tasks on dedicated review branches.
+Tokenshare is a persistent Python controller and AIML skill that connects repository owners who define work with agent owners who review and run that work. It watches Git repositories for autonomous coding tasks, clones configured repositories beneath a user-selected development directory, and publishes completed tasks on dedicated review branches.
+
+## Who uses Tokenshare
+
+Tokenshare has two distinct human workflows. The same person may fill both roles, but the handoff and responsibilities remain separate:
+
+| Role | Uses | Responsibility |
+| --- | --- | --- |
+| **Repository owner** | A repository's `tokenshare_tasklist.md` and, optionally, the `$tokenshare` skill's `-ct/--create-task` and `-gt/--grill-task` commands | Defines decision-complete tasks, reviews the proposed tasklist edit, and manually commits and pushes the tasklist to the repository's remote default branch. The repository owner does not use the controller to approve or execute work. |
+| **Agent owner** | `tokenshare-controller`, its approval TUI, agent configuration, local intake/task logs, and optional tmux viewer | Chooses which repositories to monitor, inspects every imported task, approves trusted work, monitors execution, and reviews controller output. The controller commits the implementation and pushes a dedicated review branch; the agent owner does not author or edit the repository owner's task on intake. |
+
+The remote tasklist is the boundary between the roles. A repository owner publishes a task; an agent owner's controller imports a snapshot as Unapproved; the agent owner reviews and approves it; then the controller runs an unattended coding agent and publishes the result for normal code review. Repository ownership and agent ownership do not imply trust: the agent owner is responsible for deciding whether a remote task is safe to execute.
 
 ## Security model
 
 Tokenshare does not sandbox repositories, tasks, coding agents, commands, credentials, or network access. Coding agents execute directly with the permissions and environment of the controller process. Inspect tasks yourself and run Tokenshare only inside a secure, disposable VM that provides the isolation appropriate for your repositories and credentials.
 
-## Quick start
+## Agent-owner quick start
 
 1. Run `python3 install.py`. The installer records the development directory, installs the controller and skill, and installs `prompt_toolkit` when necessary.
 2. Add one repository URL per line to `config/task_repos.md`.
-3. Add `tokenshare_tasklist.md` to the root or `docs/` directory of every configured repository.
+3. Confirm that every configured repository has exactly one `tokenshare_tasklist.md`, either at its root or in `docs/`.
 4. Ensure ordinary `git clone`, `git pull`, and `git push` work with the VM user's credentials.
-5. Start the interactive controller:
+5. Start the interactive controller and review imported tasks before approving them:
 
 ```bash
 tokenshare-controller
@@ -43,6 +54,38 @@ repository task logs. It does not alter cloned repositories or remote branches, 
 deletes or truncates the controller audit log. It does not initialize an agent, worker, TUI,
 or attachment viewer.
 
+## Repository-owner workflow
+
+Repository owners create the work that an agent owner's controller will later discover. They do not need to install or run the controller.
+
+1. Add exactly one `tokenshare_tasklist.md` at the repository root or under `docs/`, using the format below.
+2. Write a uniquely titled task under `## Pending Tasks`. Treat its text as the complete contract for an unattended coding agent: include scope, behavior, constraints, edge cases, testing expectations, acceptance criteria, and useful file or interface context. The implementation agent cannot stop to ask the repository owner clarifying questions.
+3. Optionally use the Tokenshare skill in Plan mode to turn an idea into a stronger task:
+
+```text
+/plan $tokenshare -ct Add the task idea here
+/plan $tokenshare -gt Exact Existing Task Title
+```
+
+`-ct/--create-task` inspects the repository, asks planning questions, and proposes a complete Pending task. `-gt/--grill-task` repeatedly challenges and refines an existing local Pending task by title or position. Both commands show the exact proposed tasklist edit for approval and only modify the local tasklist after explicit approval in execution mode. They never commit or push.
+
+4. Review the resulting task text, then manually commit and push the tasklist change to the repository's remote default branch using the repository's normal Git and review process. Tokenshare does not publish repository-owner task edits.
+5. Wait for the agent owner to review and approve the imported task. After execution, review the controller-published `tokenshare-dev-...` branch through the repository's normal code-review and merge process.
+
+Editing or removing an unstarted task on the remote default branch invalidates the agent owner's previous snapshot. The changed task is imported again as Unapproved and must receive fresh approval.
+
+## Agent-owner workflow
+
+Agent owners operate the trusted environment in which coding agents run. Their workflow begins only after a repository owner has pushed a task to a configured remote repository.
+
+1. Configure the repositories, Git credentials, coding agent, worker count, and optional tmux viewer in the secure VM where the controller will run.
+2. Start `tokenshare-controller`. It fetches configured repositories and copies new remote tasks into `<development-directory>/logs/agent/tokenshare_agent_tasklist.md` with source metadata and an `[Unapproved]` tag.
+3. Read the complete imported task and verify its source and safety. Use `view` to inspect the queue, then approve only trusted tasks with the TUI's `approve` commands. If the repository owner changes an unstarted task, review and approve the new snapshot again.
+4. Monitor lifecycle state and activity in the TUI. Optionally attach a separate tmux viewer to observe the active coding-agent session. The controller handles retries and phase transitions while keeping durable logs outside monitored repositories.
+5. Let the controller create the task branch, run implementation and tests, commit the completed changes, and push the dedicated review branch. The controller never merges or modifies the remote default branch; review and merge remain part of the repository's normal process.
+
+The agent owner should not rewrite imported task text to make it executable. Missing or ambiguous requirements should go back to the repository owner, who can refine and republish the task. `--dangerously-skip-approvals` removes this human review boundary and is appropriate only when every imported task is authored and trusted by the agent owner.
+
 ## Approval controller
 
 The interactive `prompt_toolkit` interface uses one full-screen renderer with a task pane, scrollable activity pane, fixed command input, and status bar. Drag the divider between Tasks and Activity (or use Ctrl-Up/Ctrl-Down) to give either pane more room. Background updates never write directly over the `tokenshare>` prompt. The status bar shows active repositories, worker use, uptime, and idle time; the original shell screen returns when the controller exits.
@@ -59,7 +102,11 @@ help
 quit
 ```
 
-Task numbers are stable and never reused. Ranges are inclusive. `view` orders Pending/Unapproved tasks first, followed by Pending/Approved, WIP, and Done, and shows each task's repository, author, approval, lifecycle state, title, and number.
+Ranges are inclusive. `view` orders Pending/Unapproved tasks first, followed by Pending/Approved,
+WIP, and Done, and shows each task's repository, author, approval, lifecycle state, and title.
+Approval numbers are temporary and appear only on unapproved tasks. After any approval, approved
+tasks lose their numbers and the remaining unapproved tasks are renumbered contiguously from 1.
+The Tasks pane always displays those numbered tasks first.
 
 After each fetch, the controller compares the remotely tracked tasklist with its local intake state. New tasks are copied to `<development-directory>/logs/agent/tokenshare_agent_tasklist.md` with source metadata and an `[Unapproved]` tag. Review the complete task there in an editor, then approve it from the controller. Editing or removing an unstarted remote task revokes its old snapshot; edited content receives a new number and requires fresh approval.
 
@@ -127,6 +174,13 @@ Section names and task states are exact. Task titles must be unique.
 | `TOKENSHARE_STATE` | `~/.config/tokenshare/state.json` | Stable IDs, scans, and publication state |
 
 Command-line flags override environment variables. Run `tokenshare-controller --help` for details.
+
+## Task authoring skill commands
+
+In Plan mode, use `$tokenshare -ct [IDEA]` to create a decision-complete local Pending task, or
+`$tokenshare -gt [TITLE|POSITION]` to repeatedly grill and refine an existing local Pending task.
+Both workflows inspect the repository, conduct Q&A, and present the exact tasklist edit for
+approval. They modify only the local tasklist after approval and never commit or push it.
 
 ## Tests
 

@@ -393,7 +393,8 @@ class TaskParsingTests(unittest.TestCase):
         rendered = controller.render_queue([third, second, first])
         self.assertEqual(rendered.count("### </task>"), 3)
         parsed = controller.parse_queue(rendered)
-        self.assertEqual([task.number for task in parsed], [1, 2, 3])
+        self.assertEqual([task.number for task in parsed], [1, None, None])
+        self.assertEqual(rendered.count("- Task-Number:"), 1)
         view = controller.format_queue_view(parsed)
         self.assertLess(view.index("Implement Awesome Feature"), view.index("Second"))
         self.assertLess(view.index("Second"), view.index("Third"))
@@ -407,9 +408,64 @@ class TaskParsingTests(unittest.TestCase):
                 4, remote, Path("/tmp/repo"), "remote", "a" * 40, "Author",
             )
             controller.save_queue(path, [item])
-            self.assertEqual(controller.approve_tasks(path, "4", root / "logs"), [4])
-            self.assertEqual(controller.load_queue(path)[0].approval, "Approved")
+            self.assertEqual(controller.approve_tasks(path, "1", root / "logs"), [1])
+            approved = controller.load_queue(path)[0]
+            self.assertEqual(approved.approval, "Approved")
+            self.assertIsNone(approved.number)
             self.assertTrue(controller.task_log_path(root / "logs", item.branch).is_file())
+
+    def test_approval_atomically_renumbers_remaining_unapproved_tasks(self):
+        remote = controller.parse_tasks(TASKLIST)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue = controller.queue_path(root)
+            tasks = [
+                dataclasses.replace(
+                    controller.queue_task_from_remote(
+                        number, remote, Path("/tmp/repo"), "remote",
+                        chr(96 + number) * 40, "Author",
+                    ),
+                    task_id=chr(96 + number) * 64,
+                    title=f"Task {number}",
+                )
+                for number in range(1, 6)
+            ]
+            controller.save_queue(queue, tasks)
+            self.assertEqual(
+                controller.approve_tasks(queue, "1,3,5", root / "logs"),
+                [1, 3, 5],
+            )
+            saved = controller.load_queue(queue)
+            remaining = [task for task in saved if task.approval == "Unapproved"]
+            approved = [task for task in saved if task.approval == "Approved"]
+            self.assertEqual([task.title for task in remaining], ["Task 2", "Task 4"])
+            self.assertEqual([task.number for task in remaining], [1, 2])
+            self.assertTrue(all(task.number is None for task in approved))
+
+    def test_migrate_queue_strips_legacy_approved_numbers(self):
+        remote = controller.parse_tasks(TASKLIST)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue = controller.queue_path(root)
+            first = controller.queue_task_from_remote(
+                7, remote, Path("/tmp/repo"), "remote", "a" * 40, "Author",
+            )
+            second = dataclasses.replace(
+                first, number=8, task_id="b" * 64, title="Approved",
+                approval="Approved",
+            )
+            text = controller.render_queue([first, second])
+            text = text.replace(
+                "### <task> [Pending] [Approved] Approved\n",
+                "### <task> [Pending] [Approved] Approved\n- Task-Number: 8\n",
+            )
+            queue.parent.mkdir(parents=True, exist_ok=True)
+            queue.write_text(text, encoding="utf-8")
+            migrated = controller.migrate_queue(queue)
+            self.assertEqual([task.number for task in migrated], [1, None])
+            self.assertEqual(
+                queue.read_text(encoding="utf-8").count("- Task-Number:"), 1
+            )
 
     def test_automatic_approval_is_distinctly_audited(self):
         remote = controller.parse_tasks(TASKLIST)[0]
@@ -427,6 +483,27 @@ class TaskParsingTests(unittest.TestCase):
             audit = controller.task_log_path(logs, item.branch).read_text(encoding="utf-8")
             self.assertIn("Event: auto-approved", audit)
             self.assertIn("--dangerously-skip-approvals", audit)
+            self.assertIsNone(controller.load_queue(queue)[0].number)
+
+    def test_queue_number_normalization_handles_removal_and_new_import(self):
+        remote = controller.parse_tasks(TASKLIST)[0]
+        tasks = [
+            dataclasses.replace(
+                controller.queue_task_from_remote(
+                    number, remote, Path("/tmp/repo"), "remote",
+                    chr(96 + number) * 40, "Author",
+                ),
+                task_id=chr(96 + number) * 64,
+                title=f"Task {number}",
+            )
+            for number in range(1, 4)
+        ]
+        tasks.pop(1)
+        tasks.append(dataclasses.replace(
+            tasks[-1], number=99, task_id="z" * 64, title="New Task"
+        ))
+        controller.normalize_queue_numbers(tasks)
+        self.assertEqual([task.number for task in tasks], [1, 2, 3])
 
     def test_clear_history_preserves_controller_audit_logs(self):
         with tempfile.TemporaryDirectory() as directory:
