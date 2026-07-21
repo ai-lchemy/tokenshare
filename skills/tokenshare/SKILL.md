@@ -19,7 +19,7 @@ Operate Tokenshare as a persistent process. Treat the task text as the complete 
 
 Run `tokenshare-controller`. New remote tasks are copied into `<development-directory>/logs/tokenshare_agent_tasklist.md` as `[Unapproved]` and cannot execute until a human reviews them and enters an `approve` command.
 
-Use `view`, `approve 1,3`, `approve 1:9`, `approve all`, or `approve all not 1,3`. Task numbers are stable and ranges are inclusive. Use `--workers N` for concurrency across repositories; only one task may execute in any repository. Use `-ni/--non-interactive-mode` to synchronize, drain previously approved work, and exit.
+Use `view`, `approve 1,3`, `approve 1:9`, `approve all`, or `approve all not 1,3`. Task numbers are stable and ranges are inclusive. Use `--workers N` for concurrency across repositories; only one task may execute in any repository. Use `-ni/--non-interactive-mode` to synchronize, drain previously approved work, and exit. The controller is a full-screen TUI. `--auto-attach TTY` requires a separate terminal already running a tmux client (`tmux new-session -A -s tokenshare-viewer`); plain-shell TTYs and the controller TTY are rejected.
 
 ## Task contract
 
@@ -27,7 +27,7 @@ Create deterministic review branches from the remote default branch and move eac
 
 All controller, approval, and task logs belong under `<development-directory>/logs/`. Never create status or log files inside monitored repositories.
 
-Preserve the `allow-multiple-branches: true` configuration, managed-branch recovery, declined fingerprint tracking, indefinite agent retry, and optional `--auto-attach [TTY]` behavior.
+Preserve the `allow-multiple-branches: true` configuration, managed-branch recovery, declined fingerprint tracking, indefinite agent retry, and optional `--auto-attach TTY` behavior.
 
 ## Security
 

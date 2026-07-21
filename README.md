@@ -34,7 +34,7 @@ Fresh remote tasks are always imported as Unapproved, so noninteractive mode nev
 
 ## Approval controller
 
-The interactive `prompt_toolkit` interface keeps its command prompt active beneath task and log output. Its toolbar shows active repositories, worker use, uptime, and idle time.
+The interactive `prompt_toolkit` interface uses one full-screen renderer with a task pane, scrollable activity pane, fixed command input, and status bar. Background updates never write directly over the `tokenshare>` prompt. The status bar shows active repositories, worker use, uptime, and idle time; the original shell screen returns when the controller exits.
 
 Commands:
 
@@ -56,7 +56,20 @@ Use `--workers N` to execute tasks from different repositories concurrently. The
 
 ## Agent and branch workflow
 
-The default agent is `codex --dangerously-bypass-approvals-and-sandbox` in a detached tmux session. Supported agents receive their noninteractive permission-bypass flags so they can update the external task log; this is why the controller must run inside a secure VM. Select a bundled stub with `-a/--agent`, provide a raw command with `--agent-command`, attach agent TUIs with `--auto-attach [TTY]`, or use `--no-tmux` for tests and noninteractive agents.
+The default agent is `codex --dangerously-bypass-approvals-and-sandbox` in a detached tmux session. Supported agents receive their noninteractive permission-bypass flags so they can update the external task log; this is why the controller must run inside a secure VM. Select a bundled stub with `-a/--agent`, provide a raw command with `--agent-command`, or use `--no-tmux` for tests and noninteractive agents.
+
+Automatic attachment requires a separate terminal that is already running a tmux client. This avoids making the terminal's shell and agent compete for input and terminal modes:
+
+```bash
+# In the separate agent-viewer terminal:
+tmux new-session -A -s tokenshare-viewer
+tty
+
+# In the controller terminal, using the path printed above:
+tokenshare-controller --auto-attach /dev/pts/9
+```
+
+The controller switches that tmux client between its viewer shell and agent sessions. Mouse-wheel scrolling enters tmux copy mode with up to 50,000 lines of history; `q` leaves copy mode and `Ctrl-b d` detaches the viewer without stopping the agent. Ctrl-C continues to exit the controller when used in the controller TUI. Plain-shell TTYs and the controller's own TTY are rejected because they cannot safely host a remotely spawned full-screen client.
 
 For every approved task, the controller creates `tokenshare-dev-<task-title>-<fingerprint>` from the remote default branch. It moves the task from Pending to WIP on that branch, runs implementation and testing phases, moves it to Done, commits the result, and pushes the review branch. It never pushes, merges, or deletes the remote default branch.
 

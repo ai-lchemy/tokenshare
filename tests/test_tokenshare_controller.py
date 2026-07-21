@@ -9,6 +9,7 @@ import pty
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -74,9 +75,8 @@ class TaskParsingTests(unittest.TestCase):
             self.assertEqual(args.config, Path("/opt/tokenshare/config/task_repos.md"))
             self.assertEqual(args.workspace, Path("/work/repos"))
 
-    def test_auto_attach_accepts_current_or_explicit_tty(self):
+    def test_auto_attach_requires_an_explicit_tty(self):
         parser = controller.build_parser()
-        self.assertEqual(parser.parse_args(["--auto-attach"]).auto_attach, "current")
         self.assertEqual(
             parser.parse_args(["--auto-attach", "/dev/pts/9"]).auto_attach,
             "/dev/pts/9",
@@ -84,7 +84,7 @@ class TaskParsingTests(unittest.TestCase):
 
     def test_auto_attach_rejects_no_tmux(self):
         with self.assertRaisesRegex(controller.TokenshareError, "cannot be used"):
-            controller.main(["--no-tmux", "--auto-attach"])
+            controller.main(["--no-tmux", "--auto-attach", "/dev/pts/9"])
 
     def test_resolves_and_validates_explicit_tty(self):
         master, slave = pty.openpty()
@@ -100,12 +100,43 @@ class TaskParsingTests(unittest.TestCase):
             with self.assertRaisesRegex(controller.AttachmentError, "not a TTY"):
                 controller.resolve_attach_target(regular_file.name)
 
+    def test_controller_tty_cannot_be_used_for_auto_attach(self):
+        with self.assertRaisesRegex(controller.AttachmentError, "controller terminal"):
+            controller.validate_attach_target(
+                controller.AttachTarget(Path("/dev/pts/0"), True)
+            )
+        target = controller.AttachTarget(Path("/dev/pts/1"), False)
+        with mock.patch.object(
+            controller, "_tmux_client_for_tty",
+            return_value=("client", "viewer", Path("/dev/pts/4"))
+        ):
+            validated = controller.validate_attach_target(target)
+            self.assertEqual(validated.path, Path("/dev/pts/4"))
+        with mock.patch.object(controller, "_tmux_client_for_tty", return_value=None):
+            with self.assertRaisesRegex(controller.AttachmentError, "has no tmux client"):
+                controller.validate_attach_target(target)
+
+    def test_tmux_client_lookup_accepts_outer_or_inner_tty(self):
+        completed = subprocess.CompletedProcess(
+            [], 0, "client-1\t/dev/pts/4\tviewer\t/dev/pts/9\n", ""
+        )
+        with mock.patch.object(controller, "run", return_value=completed):
+            self.assertEqual(
+                controller._tmux_client_for_tty(Path("/dev/pts/4")),
+                ("client-1", "viewer", Path("/dev/pts/4")),
+            )
+            self.assertEqual(
+                controller._tmux_client_for_tty(Path("/dev/pts/9")),
+                ("client-1", "viewer", Path("/dev/pts/4")),
+            )
+
     def test_tmux_client_attachment_switches_back_to_original_session(self):
         target = controller.AttachTarget(Path("/dev/pts/9"), False)
         attachment = controller.AgentAttachment("agent-session", target)
         completed = subprocess.CompletedProcess([], 0, "", "")
         with mock.patch.object(
-            controller, "_tmux_client_for_tty", return_value=("client-1", "controller")
+            controller, "_tmux_client_for_tty",
+            return_value=("client-1", "controller", Path("/dev/pts/9"))
         ), mock.patch.object(controller, "run", return_value=completed) as run_mock:
             attachment.start()
             attachment.close()
@@ -125,7 +156,8 @@ class TaskParsingTests(unittest.TestCase):
         attachment.client_name = "client-1"
         attachment.original_session = "controller"
         with mock.patch.object(
-            controller, "_tmux_client_for_tty", return_value=("client-1", "other")
+            controller, "_tmux_client_for_tty",
+            return_value=("client-1", "other", Path("/dev/pts/9"))
         ), mock.patch.object(controller.os, "open", return_value=99), mock.patch.object(
             controller.os, "isatty", return_value=True
         ), mock.patch.object(controller.os, "close"), mock.patch.object(
@@ -213,6 +245,17 @@ class TaskParsingTests(unittest.TestCase):
         self.assertFalse(run_mock.call_args_list[0].kwargs["resume"])
         self.assertTrue(run_mock.call_args_list[1].kwargs["resume"])
         self.assertTrue(run_mock.call_args_list[2].kwargs["resume"])
+
+    def test_controller_shutdown_interrupts_agent_retry_wait(self):
+        previous = controller.CONTROLLER_STOP_EVENT
+        stop_event = controller.threading.Event()
+        stop_event.set()
+        controller.CONTROLLER_STOP_EVENT = stop_event
+        try:
+            with self.assertRaises(controller.ControllerStopped):
+                controller._retry_wait(30)
+        finally:
+            controller.CONTROLLER_STOP_EVENT = previous
 
     def test_opencode_child_gets_allow_all_permission_environment(self):
         task = controller.parse_tasks(TASKLIST)[0]
@@ -355,6 +398,86 @@ class TaskParsingTests(unittest.TestCase):
             self.assertEqual(controller.approve_tasks(path, "4", root / "logs"), [4])
             self.assertEqual(controller.load_queue(path)[0].approval, "Approved")
             self.assertTrue(controller.task_log_path(root / "logs", item.branch).is_file())
+
+    def test_log_entry_monitor_deduplicates_rewrites_and_reordering(self):
+        first = "## 2026-01-01T00:00:00Z\n\n- Progress: first\n"
+        second = "## 2026-01-01T00:01:00Z\n\n- Progress: second\n"
+        third = "## 2026-01-01T00:02:00Z\n\n- Progress: third\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "task_log.md"
+            path.write_text("# Log\n\n" + first, encoding="utf-8")
+            seen = {fingerprint for fingerprint, _ in controller._log_blocks(
+                path.read_text(encoding="utf-8")
+            )}
+            path.write_text("# Log\n\n" + first + "\n" + second, encoding="utf-8")
+            _current, seen, entries = controller._new_log_entries(path, seen)
+            self.assertEqual(len(entries), 1)
+            self.assertIn("second", entries[0])
+            path.write_text("# Log\n\n" + second + "\n" + first + "\n" + third,
+                            encoding="utf-8")
+            _current, seen, entries = controller._new_log_entries(path, seen)
+            self.assertEqual(len(entries), 1)
+            self.assertIn("third", entries[0])
+
+    def test_full_screen_tui_preserves_typed_command_on_log_update(self):
+        from prompt_toolkit.input import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        with tempfile.TemporaryDirectory() as directory, create_pipe_input() as pipe_input:
+            root = Path(directory)
+            queue = controller.queue_path(root)
+            controller.save_queue(queue, [])
+            runtime = types.SimpleNamespace(
+                queue_file=queue,
+                logs_dir=root / "logs",
+                toolbar=lambda: " active: none | workers: 0/1 | uptime: 00:00:01 ",
+            )
+            tui = controller.ControllerTUI(
+                runtime, input=pipe_input, output=DummyOutput()
+            )
+            try:
+                tui.command_area.text = "approve 1"
+                tui.enqueue_log("[2026-01-01T00:00:00Z] background update")
+                tui._before_render(tui.application)
+                self.assertEqual(tui.command_area.text, "approve 1")
+                self.assertIn("background update", tui.log_area.text)
+                self.assertTrue(tui.application.full_screen)
+            finally:
+                tui.close()
+
+    def test_full_screen_tui_processes_commands_and_exits_cleanly(self):
+        from prompt_toolkit.input import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        with tempfile.TemporaryDirectory() as directory, create_pipe_input() as pipe_input:
+            root = Path(directory)
+            queue = controller.queue_path(root)
+            controller.save_queue(queue, [])
+            runtime = types.SimpleNamespace(
+                queue_file=queue,
+                logs_dir=root / "logs",
+                toolbar=lambda: " active: none ",
+                start=mock.Mock(),
+                stop=mock.Mock(),
+            )
+            tui = controller.ControllerTUI(
+                runtime, input=pipe_input, output=DummyOutput()
+            )
+            pipe_input.send_text("help\nquit\n")
+            self.assertEqual(tui.run(), 0)
+            runtime.start.assert_called_once_with()
+            runtime.stop.assert_called_once_with()
+
+    def test_interactive_log_listener_suppresses_legacy_terminal_print(self):
+        listener = mock.Mock()
+        controller.LOG_LISTENERS.append(listener)
+        try:
+            with mock.patch.object(controller.DASHBOARD, "message") as dashboard_message:
+                controller.log("background event")
+            dashboard_message.assert_not_called()
+            listener.assert_called_once()
+        finally:
+            controller.LOG_LISTENERS.remove(listener)
 
 
 class ControllerIntegrationTests(unittest.TestCase):

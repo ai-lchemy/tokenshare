@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import dataclasses
 import datetime as dt
 import hashlib
@@ -26,6 +27,10 @@ class TokenshareError(RuntimeError):
 
 class AttachmentError(TokenshareError):
     """A non-retryable failure involving the requested attachment terminal."""
+
+
+class ControllerStopped(TokenshareError):
+    """Internal signal used to stop active agent monitoring cleanly."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,6 +99,7 @@ UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 QUEUE_LOCK = threading.RLock()
 CONTROLLER_LOG: Path | None = None
 LOG_LISTENERS: list[Callable[[str], None]] = []
+CONTROLLER_STOP_EVENT: threading.Event | None = None
 
 
 class Dashboard:
@@ -188,7 +194,6 @@ DASHBOARD = Dashboard()
 
 
 def log(message: str) -> None:
-    DASHBOARD.message(message)
     rendered = f"[{dt.datetime.now(dt.timezone.utc).strftime(UTC_FORMAT)}] {message}"
     with QUEUE_LOCK:
         if CONTROLLER_LOG is not None:
@@ -197,6 +202,8 @@ def log(message: str) -> None:
                 stream.write(rendered + "\n")
         for listener in list(LOG_LISTENERS):
             listener(rendered)
+        if not LOG_LISTENERS:
+            DASHBOARD.message(message)
 
 
 def run(
@@ -940,17 +947,29 @@ def resolve_agent_command(agent: str | None, agent_command: str) -> str:
     return shlex.quote(str(stub))
 
 
-def _new_log_entries(path: Path, previous: str) -> tuple[str, list[str]]:
-    current = path.read_text(encoding="utf-8") if path.exists() else ""
-    if current == previous:
-        return current, []
-    addition = current[len(previous):] if current.startswith(previous) else current
-    entries: list[str] = []
-    for block in re.split(r"(?=^##\s+)", addition, flags=re.MULTILINE):
+def _log_blocks(text: str) -> list[tuple[str, str]]:
+    blocks: list[tuple[str, str]] = []
+    for block in re.split(r"(?=^##\s+)", text, flags=re.MULTILINE):
         lines = [line.strip() for line in block.splitlines() if line.strip()]
         if lines and lines[0].startswith("## "):
-            entries.append(" | ".join(line.removeprefix("- ") for line in lines))
-    return current, entries
+            normalized = "\n".join(lines)
+            fingerprint = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+            rendered = " | ".join(line.removeprefix("- ") for line in lines)
+            blocks.append((fingerprint, rendered))
+    return blocks
+
+
+def _new_log_entries(path: Path, seen: set[str]) -> tuple[str, set[str], list[str]]:
+    """Return only unseen timestamp blocks, tolerating rewrites and reordering."""
+    current = path.read_text(encoding="utf-8") if path.exists() else ""
+    updated = set(seen)
+    entries: list[str] = []
+    for fingerprint, rendered in _log_blocks(current):
+        if fingerprint in updated:
+            continue
+        updated.add(fingerprint)
+        entries.append(rendered)
+    return current, updated, entries
 
 
 def _current_tty() -> Path | None:
@@ -989,24 +1008,45 @@ def resolve_attach_target(value: str | None) -> AttachTarget | None:
     )
 
 
-def _tmux_client_for_tty(tty: Path) -> tuple[str, str] | None:
+def validate_attach_target(target: AttachTarget | None) -> AttachTarget | None:
+    if target is None:
+        return None
+    if target is not None and target.is_controller_tty:
+        raise AttachmentError(
+            "--auto-attach cannot target the controller terminal; omit it or provide "
+            "a TTY from a separate terminal (for example /dev/pts/3)"
+        )
+    matched = _tmux_client_for_tty(target.path)
+    if matched is None:
+        raise AttachmentError(
+            f"--auto-attach target {target.path} has no tmux client. In the separate "
+            "terminal run 'tmux new-session -A -s tokenshare-viewer', then pass the "
+            "TTY reported by 'tty' from inside that tmux session"
+        )
+    return AttachTarget(matched[2], False)
+
+
+def _tmux_client_for_tty(tty: Path) -> tuple[str, str, Path] | None:
     clients = run(
-        ["tmux", "list-clients", "-F", "#{client_name}\t#{client_tty}\t#{session_name}"],
+        ["tmux", "list-clients", "-F",
+         "#{client_name}\t#{client_tty}\t#{session_name}\t#{pane_tty}"],
         check=False,
     )
     if clients.returncode:
         return None
     for line in clients.stdout.splitlines():
-        fields = line.split("\t", 2)
-        if len(fields) != 3:
+        fields = line.split("\t", 3)
+        if len(fields) != 4:
             continue
-        name, client_tty, session = fields
-        try:
-            matches = Path(client_tty).resolve() == tty
-        except OSError:
-            matches = client_tty == str(tty)
+        name, client_tty, session, pane_tty = fields
+        matches = False
+        for candidate in (client_tty, pane_tty):
+            try:
+                matches = matches or Path(candidate).resolve() == tty
+            except OSError:
+                matches = matches or candidate == str(tty)
         if matches:
-            return name, session
+            return name, session, Path(client_tty).resolve()
     return None
 
 
@@ -1016,14 +1056,12 @@ class AgentAttachment:
         self.target = target
         self.client_name: str | None = None
         self.original_session: str | None = None
-        self.process: subprocess.Popen[bytes] | None = None
-        self.terminal = None
         self.closed = False
 
     def start(self) -> None:
         matched = _tmux_client_for_tty(self.target.path)
         if matched:
-            self.client_name, self.original_session = matched
+            self.client_name, self.original_session = matched[:2]
             result = run(
                 ["tmux", "switch-client", "-c", self.client_name, "-t", self.session],
                 check=False,
@@ -1034,20 +1072,10 @@ class AgentAttachment:
                     f"{(result.stderr or result.stdout).strip()}"
                 )
         else:
-            try:
-                self.terminal = open(self.target.path, "r+b", buffering=0)
-                self.process = subprocess.Popen(
-                    ["tmux", "attach-session", "-t", self.session],
-                    stdin=self.terminal,
-                    stdout=self.terminal,
-                    stderr=self.terminal,
-                    close_fds=True,
-                )
-            except OSError as exc:
-                self.close()
-                raise AttachmentError(
-                    f"Could not attach tmux session to {self.target.path}: {exc}"
-                ) from exc
+            raise AttachmentError(
+                f"tmux client on {self.target.path} disappeared before attachment; "
+                "restart the viewer tmux session and retry"
+            )
         if self.target.is_controller_tty:
             DASHBOARD.suspend()
 
@@ -1076,23 +1104,6 @@ class AgentAttachment:
                 self.original_session = None
                 if self.target.is_controller_tty:
                     DASHBOARD.resume()
-        elif self.process is not None and self.process.poll() is not None:
-            returncode = self.process.returncode
-            if returncode:
-                log(
-                    f"tmux attachment on {self.target.path} exited with status {returncode}; "
-                    "agent monitoring continues"
-                )
-            # A normal return here means the user manually detached. Monitoring continues.
-            self._release_terminal()
-            if self.target.is_controller_tty:
-                DASHBOARD.resume()
-
-    def _release_terminal(self) -> None:
-        if self.terminal is not None:
-            self.terminal.close()
-            self.terminal = None
-        self.process = None
 
     def close(self) -> None:
         if self.closed:
@@ -1103,12 +1114,6 @@ class AgentAttachment:
                 ["tmux", "switch-client", "-c", self.client_name, "-t", self.original_session],
                 check=False,
             )
-        if self.process is not None and self.process.poll() is None:
-            try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.terminate()
-        self._release_terminal()
         if self.target.is_controller_tty:
             DASHBOARD.resume()
 
@@ -1155,6 +1160,8 @@ def _run_agent_once(
         session = f"tokenshare-{os.getpid()}-{safe_title or 'agent'}-{phase[:4]}"
         run(["tmux", "new-session", "-d", "-s", session, "-c", str(repo)])
         run(["tmux", "set-option", "-t", session, "remain-on-exit", "on"])
+        run(["tmux", "set-option", "-t", session, "mouse", "on"])
+        run(["tmux", "set-option", "-t", session, "history-limit", "50000"])
         tmux_args = [
             "tmux", "respawn-pane", "-k", "-t", session, "-c", str(repo),
             "-e", f"TOKENSHARE_TASK_TITLE={task.title}",
@@ -1173,10 +1180,13 @@ def _run_agent_once(
             except Exception:
                 run(["tmux", "kill-session", "-t", session], check=False)
                 raise
-        previous = status_path.read_text(encoding="utf-8") if status_path.exists() else ""
+        current_log = status_path.read_text(encoding="utf-8") if status_path.exists() else ""
+        seen_log_blocks = {fingerprint for fingerprint, _ in _log_blocks(current_log)}
         returncode = 1
         try:
             while True:
+                if CONTROLLER_STOP_EVENT is not None and CONTROLLER_STOP_EVENT.is_set():
+                    raise ControllerStopped("controller shutdown requested")
                 if attachment:
                     attachment.check_target()
                 state = run(
@@ -1186,11 +1196,13 @@ def _run_agent_once(
                 if state.returncode:
                     raise TokenshareError(f"tmux agent session {session!r} disappeared")
                 values = state.stdout.strip().split()
-                previous, entries = _new_log_entries(status_path, previous)
+                current_log, seen_log_blocks, entries = _new_log_entries(
+                    status_path, seen_log_blocks
+                )
                 for entry in entries:
                     log(f"task log: {entry}")
                 DASHBOARD.refresh()
-                if phase_completion_marker(phase) in previous:
+                if phase_completion_marker(phase) in current_log:
                     log(f"Agent reported {phase} phase complete")
                     returncode = 0
                     break
@@ -1221,6 +1233,8 @@ def _run_agent_once(
 def _retry_wait(seconds: int) -> None:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
+        if CONTROLLER_STOP_EVENT is not None and CONTROLLER_STOP_EVENT.is_set():
+            raise ControllerStopped("controller shutdown requested")
         DASHBOARD.refresh()
         time.sleep(min(1, max(0, deadline - time.monotonic())))
 
@@ -1249,7 +1263,7 @@ def run_agent(
                 auto_attach=auto_attach,
             )
             failure = f"exited with status {returncode}"
-        except AttachmentError:
+        except (AttachmentError, ControllerStopped):
             raise
         except (TokenshareError, OSError, subprocess.SubprocessError) as exc:
             returncode = 1
@@ -1504,6 +1518,9 @@ def process_task(
         append_task_log(status_path, "branch-published", f"origin/{branch} at {head}")
         if local_queue is not None:
             update_queue_task(local_queue, task_id, state="Done", approval="Approved")
+    except ControllerStopped:
+        log(f"Paused {repo.name}: {task.title} during controller shutdown")
+        raise
     except Exception as exc:
         write_task_log(
             status_path, wip_task, "failed", str(exc), task_id=task_id, branch=branch
@@ -1707,11 +1724,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--auto-attach",
-        nargs="?",
-        const="current",
         default=os.environ.get("TOKENSHARE_AUTO_ATTACH"),
         metavar="TTY",
-        help="Attach agent TUIs to the current terminal or an optional TTY path",
+        help="Attach agent TUIs to a separate terminal TTY path",
     )
     return parser
 
@@ -1719,6 +1734,7 @@ def build_parser() -> argparse.ArgumentParser:
 class ControllerRuntime:
     def __init__(self, args: argparse.Namespace, agent_command: str,
                  auto_attach: AttachTarget | None) -> None:
+        global CONTROLLER_STOP_EVENT
         from concurrent.futures import ThreadPoolExecutor
 
         self.args = args
@@ -1743,6 +1759,7 @@ class ControllerRuntime:
         self.started = time.monotonic()
         self.idle_since = self.started
         self.stop_event = threading.Event()
+        CONTROLLER_STOP_EVENT = self.stop_event
         self.wake_event = threading.Event()
         self.last_error: Exception | None = None
         self.thread: threading.Thread | None = None
@@ -1854,33 +1871,157 @@ def handle_controller_command(command: str, runtime: ControllerRuntime,
     raise TokenshareError(f"Unknown command: {value}")
 
 
+class ControllerTUI:
+    """Full-screen renderer that exclusively owns interactive terminal output."""
+
+    MAX_LOG_EVENTS = 2000
+
+    def __init__(self, runtime: ControllerRuntime, *, input=None, output=None) -> None:
+        try:
+            from prompt_toolkit import Application
+            from prompt_toolkit.key_binding import KeyBindings
+            from prompt_toolkit.layout import HSplit, Layout
+            from prompt_toolkit.styles import Style
+            from prompt_toolkit.widgets import Frame, Label, TextArea
+        except ImportError as exc:
+            raise TokenshareError(
+                "prompt_toolkit is required; rerun install.py or install prompt_toolkit"
+            ) from exc
+
+        self.runtime = runtime
+        self._events: deque[str] = deque(maxlen=self.MAX_LOG_EVENTS)
+        self._pending_events: deque[str] = deque()
+        self._events_lock = threading.Lock()
+        self._queue_mtime_ns: int | None = None
+        self.closed = False
+
+        self.task_area = TextArea(
+            text="Loading tasks…", read_only=True, focusable=False,
+            scrollbar=True, wrap_lines=False, height=10,
+        )
+        self.log_area = TextArea(
+            text="", read_only=True, focusable=False,
+            scrollbar=True, wrap_lines=True,
+        )
+        self.command_area = TextArea(
+            height=1, multiline=False, prompt="tokenshare> ",
+            accept_handler=self._accept_command,
+        )
+        self.status = Label(text=self.runtime.toolbar, style="class:status")
+        root = HSplit([
+            Label(" Tokenshare Controller  |  help: commands  |  Ctrl-C: quit ",
+                  style="class:header"),
+            Frame(self.task_area, title="Tasks"),
+            Frame(self.log_area, title="Activity"),
+            self.status,
+            self.command_area,
+        ])
+        bindings = KeyBindings()
+
+        @bindings.add("c-c")
+        @bindings.add("c-d")
+        def _exit(event) -> None:
+            event.app.exit()
+
+        @bindings.add("pageup")
+        def _page_up(event) -> None:
+            self.log_area.window.vertical_scroll = max(
+                0, self.log_area.window.vertical_scroll - 10
+            )
+
+        @bindings.add("pagedown")
+        def _page_down(event) -> None:
+            self.log_area.window.vertical_scroll += 10
+
+        style = Style.from_dict({
+            "header": "bold bg:#005f87 #ffffff",
+            "status": "bg:#303030 #ffffff",
+            "frame.label": "bold #00afff",
+        })
+        self.application = Application(
+            layout=Layout(root, focused_element=self.command_area),
+            key_bindings=bindings,
+            style=style,
+            full_screen=True,
+            refresh_interval=1.0,
+            before_render=self._before_render,
+            input=input,
+            output=output,
+        )
+        LOG_LISTENERS.append(self.enqueue_log)
+        self.refresh_tasks(force=True)
+
+    def enqueue_log(self, rendered: str) -> None:
+        with self._events_lock:
+            self._pending_events.append(rendered.replace("\t", "    "))
+        self.application.invalidate()
+
+    def _drain_events(self) -> None:
+        with self._events_lock:
+            pending = list(self._pending_events)
+            self._pending_events.clear()
+        if not pending:
+            return
+        self._events.extend(pending)
+        self.log_area.text = "\n".join(self._events)
+        self.log_area.buffer.cursor_position = len(self.log_area.buffer.text)
+
+    def refresh_tasks(self, *, force: bool = False) -> None:
+        try:
+            mtime = self.runtime.queue_file.stat().st_mtime_ns
+        except OSError:
+            mtime = None
+        if not force and mtime == self._queue_mtime_ns:
+            return
+        self._queue_mtime_ns = mtime
+        self.task_area.text = format_queue_view(load_queue(self.runtime.queue_file))
+
+    def _before_render(self, _app) -> None:
+        self._drain_events()
+        self.refresh_tasks()
+        self.status.text = self.runtime.toolbar
+
+    def _command_output(self, message: str) -> None:
+        if message.startswith("#  State") or message == "No tasks have been imported.":
+            self.task_area.text = message
+            return
+        self.enqueue_log(f"[command] {message}")
+
+    def _accept_command(self, buffer) -> bool:
+        command = buffer.text
+        buffer.reset()
+        try:
+            keep_running = handle_controller_command(
+                command, self.runtime, output=self._command_output
+            )
+            self.refresh_tasks(force=True)
+            if not keep_running:
+                self.application.exit()
+        except TokenshareError as exc:
+            self.enqueue_log(f"[error] {exc}")
+        return True
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            LOG_LISTENERS.remove(self.enqueue_log)
+        except ValueError:
+            pass
+
+    def run(self) -> int:
+        self.runtime.start()
+        try:
+            self.application.run()
+        finally:
+            self.close()
+            self.runtime.stop()
+        return 0
+
+
 def run_tui(runtime: ControllerRuntime) -> int:
-    try:
-        from prompt_toolkit import PromptSession
-        from prompt_toolkit.patch_stdout import patch_stdout
-    except ImportError as exc:
-        raise TokenshareError(
-            "prompt_toolkit is required; rerun install.py or install prompt_toolkit"
-        ) from exc
-    session = PromptSession(bottom_toolbar=runtime.toolbar, refresh_interval=1.0)
-    runtime.start()
-    try:
-        with patch_stdout(raw=True):
-            print("Tokenshare controller — type 'help' for commands")
-            print(format_queue_view(load_queue(runtime.queue_file)))
-            while True:
-                try:
-                    command = session.prompt("tokenshare> ")
-                except (EOFError, KeyboardInterrupt):
-                    break
-                try:
-                    if not handle_controller_command(command, runtime):
-                        break
-                except TokenshareError as exc:
-                    print(f"ERROR: {exc}")
-    finally:
-        runtime.stop()
-    return 0
+    return ControllerTUI(runtime).run()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1894,6 +2035,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise TokenshareError("--auto-attach cannot be used with --no-tmux")
     agent_command = resolve_agent_command(args.agent, args.agent_command)
     auto_attach = resolve_attach_target(args.auto_attach)
+    auto_attach = validate_attach_target(auto_attach)
     runtime = ControllerRuntime(args, agent_command, auto_attach)
     DASHBOARD.enabled = False
     CONTROLLER_LOG = runtime.logs_dir / "tokenshare-controller.log"
