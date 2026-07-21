@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -46,10 +47,14 @@ class TaskParsingTests(unittest.TestCase):
         root = SCRIPT.parents[1]
         self.assertEqual(args.config, root / "config" / "task_repos.md")
         self.assertEqual(args.workspace, Path.home() / "tokenshare_dev")
-        self.assertEqual(args.agent_command, "codex --full-auto")
+        self.assertEqual(
+            args.agent_command, "codex --dangerously-bypass-approvals-and-sandbox"
+        )
         self.assertIsNone(args.agent)
         self.assertFalse(args.no_tmux)
         self.assertIsNone(args.auto_attach)
+        self.assertEqual(args.workers, 1)
+        self.assertFalse(args.non_interactive_mode)
 
     def test_installed_defaults_come_from_install_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -171,15 +176,20 @@ class TaskParsingTests(unittest.TestCase):
         args = controller._agent_args("opencode", "do work", Path("/tmp/repo"))
         self.assertEqual(args, ["opencode", "--auto", "--prompt", "do work"])
 
-    def test_provider_prefixed_stubs_receive_their_trust_flags(self):
+    def test_provider_stubs_own_their_permission_flags(self):
         claude = controller._agent_args(
             "/tmp/claude-sonnet.sh", "do work", Path("/tmp/repo")
         )
         opencode = controller._agent_args(
             "/tmp/opencode-gpt.sh", "do work", Path("/tmp/repo")
         )
-        self.assertIn("--dangerously-skip-permissions", claude)
-        self.assertIn("--auto", opencode)
+        codex = controller._agent_args(
+            "/tmp/codex-gpt.sh", "do work", Path("/tmp/repo")
+        )
+        self.assertNotIn("--dangerously-skip-permissions", claude)
+        self.assertNotIn("--auto", opencode)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", codex)
+        self.assertIn("--config", codex)
 
     def test_provider_resume_arguments(self):
         repo = Path("/tmp/repo")
@@ -304,6 +314,48 @@ class TaskParsingTests(unittest.TestCase):
             )
             self.assertEqual(controller.repo_name("git@github.com:b/two.git"), "two")
 
+    def test_approval_selectors_support_lists_ranges_all_and_exclusions(self):
+        eligible = {1, 2, 3, 7, 8, 9}
+        self.assertEqual(controller.parse_approval_selector("1,3,7", eligible), {1, 3, 7})
+        self.assertEqual(controller.parse_approval_selector("1:3,7:9", eligible), eligible)
+        self.assertEqual(controller.parse_approval_selector("all", eligible), eligible)
+        self.assertEqual(
+            controller.parse_approval_selector("all not 2,7:8", eligible), {1, 3, 9}
+        )
+        with self.assertRaises(controller.TokenshareError):
+            controller.parse_approval_selector("3:1", eligible)
+
+    def test_local_queue_round_trip_and_view_order(self):
+        remote = controller.parse_tasks(TASKLIST)[0]
+        first = controller.queue_task_from_remote(
+            1, remote, Path("/tmp/repo"), "https://example.invalid/repo.git",
+            "a" * 40, "Task Author <author@example.invalid>",
+        )
+        second = dataclasses.replace(first, number=2, task_id="b" * 64,
+                                     state="Pending", approval="Approved", title="Second")
+        third = dataclasses.replace(first, number=3, task_id="c" * 64,
+                                    state="Done", approval="Approved", title="Third")
+        rendered = controller.render_queue([third, second, first])
+        self.assertEqual(rendered.count("### </task>"), 3)
+        parsed = controller.parse_queue(rendered)
+        self.assertEqual([task.number for task in parsed], [1, 2, 3])
+        view = controller.format_queue_view(parsed)
+        self.assertLess(view.index("Implement Awesome Feature"), view.index("Second"))
+        self.assertLess(view.index("Second"), view.index("Third"))
+
+    def test_approve_tasks_updates_only_eligible_tasks_and_logs(self):
+        remote = controller.parse_tasks(TASKLIST)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "logs" / "tokenshare_agent_tasklist.md"
+            item = controller.queue_task_from_remote(
+                4, remote, Path("/tmp/repo"), "remote", "a" * 40, "Author",
+            )
+            controller.save_queue(path, [item])
+            self.assertEqual(controller.approve_tasks(path, "4", root / "logs"), [4])
+            self.assertEqual(controller.load_queue(path)[0].approval, "Approved")
+            self.assertTrue(controller.task_log_path(root / "logs", item.branch).is_file())
+
 
 class ControllerIntegrationTests(unittest.TestCase):
     def git(self, *args, cwd=None, env=None):
@@ -362,12 +414,21 @@ class ControllerIntegrationTests(unittest.TestCase):
                         "--workspace", str(workspace),
                         "--agent-command", command,
                         "--no-tmux",
-                        "--once",
+                        "--non-interactive-mode",
                     ]
                 )
             finally:
                 os.environ.clear()
                 os.environ.update(previous)
+            self.assertEqual(result, 0)
+            queue = controller.queue_path(workspace)
+            controller.approve_tasks(queue, "all", workspace / "logs")
+            with mock.patch.dict(os.environ, env, clear=False):
+                result = controller.main(
+                    ["--config", str(config), "--workspace", str(workspace),
+                     "--agent-command", command, "--no-tmux",
+                     "--non-interactive-mode"]
+                )
             self.assertEqual(result, 0)
             checkout = workspace / "task-repo"
             default_text = subprocess.run(
@@ -393,6 +454,15 @@ class ControllerIntegrationTests(unittest.TestCase):
                     check=True, stdout=subprocess.PIPE, text=True,
                 )
                 self.assertEqual(published.stdout, "ok\n")
+                paths = subprocess.run(
+                    ["git", f"--git-dir={remote}", "ls-tree", "-r", "--name-only", branch],
+                    check=True, stdout=subprocess.PIPE, text=True,
+                ).stdout.splitlines()
+                self.assertFalse(any("status" in path or "/logs/" in f"/{path}/"
+                                     for path in paths))
+            local_logs = workspace / "logs"
+            self.assertTrue((local_logs / "tokenshare_agent_tasklist.md").is_file())
+            self.assertEqual(len(list(local_logs.glob("tokenshare-dev-*_log.md"))), 2)
 
     def test_default_stops_after_one_outstanding_task_branch(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -430,8 +500,18 @@ class ControllerIntegrationTests(unittest.TestCase):
                         "--workspace", str(workspace),
                         "--agent-command", command,
                         "--no-tmux",
-                        "--once",
+                        "--non-interactive-mode",
                     ]
+                )
+            self.assertEqual(result, 0)
+            controller.approve_tasks(
+                controller.queue_path(workspace), "all", workspace / "logs"
+            )
+            with mock.patch.dict(os.environ, environment, clear=False):
+                result = controller.main(
+                    ["--config", str(config), "--workspace", str(workspace),
+                     "--agent-command", command, "--no-tmux",
+                     "--non-interactive-mode"]
                 )
             self.assertEqual(result, 0)
             branches = subprocess.run(
@@ -456,7 +536,7 @@ class ControllerIntegrationTests(unittest.TestCase):
                         "--workspace", str(root / "fresh-workspace"),
                         "--agent-command", command,
                         "--no-tmux",
-                        "--once",
+                        "--non-interactive-mode",
                     ]
                 )
             self.assertEqual(fresh_result, 0)
@@ -478,7 +558,7 @@ class ControllerIntegrationTests(unittest.TestCase):
                         "--workspace", str(workspace),
                         "--agent-command", command,
                         "--no-tmux",
-                        "--once",
+                        "--non-interactive-mode",
                     ]
                 )
             self.assertEqual(second, 0)

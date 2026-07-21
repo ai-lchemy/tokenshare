@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 
@@ -57,6 +58,19 @@ def install(development_directory: Path, *, home: Path | None = None) -> None:
     skill_dir = codex_home / "skills" / "tokenshare"
     bin_dir = home / ".local" / "bin"
     metadata_path = home / ".config" / "tokenshare" / "install.json"
+
+    try:
+        import prompt_toolkit  # noqa: F401
+    except ImportError:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "prompt_toolkit>=3.0,<4"],
+            text=True,
+        )
+        if result.returncode:
+            raise OSError(
+                "Could not install prompt_toolkit; install it with the current Python "
+                "interpreter and rerun install.py"
+            )
 
     development_directory.mkdir(parents=True, exist_ok=True)
     skill_dir.mkdir(parents=True, exist_ok=True)

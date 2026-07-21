@@ -14,8 +14,9 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 from urllib.parse import urlparse
 
 
@@ -36,6 +37,22 @@ class Task:
     end: int
 
 
+@dataclasses.dataclass
+class QueueTask:
+    number: int
+    task_id: str
+    state: str
+    approval: str
+    title: str
+    body: str
+    repo_name: str
+    repo_url: str
+    author: str
+    source_commit: str
+    imported_at: str
+    branch: str
+
+
 @dataclasses.dataclass(frozen=True)
 class TasklistConfig:
     allow_multiple_branches: bool = False
@@ -47,7 +64,7 @@ class ManagedBranch:
     task_id: str
     title: str
     state: str
-    status_path: Path
+    log_path: Path | None
     head: str
 
 
@@ -68,10 +85,15 @@ SECTION_FOR_STATE = {
     "Done": "Completed Tasks",
 }
 BRANCH_PREFIX = "tokenshare-dev-"
-STATUS_TASK_ID = re.compile(r"^- Task-ID:\s*([0-9a-f]{64})\s*$", re.MULTILINE)
-STATUS_TASK = re.compile(r"^- Task:\s*(.+?)\s*$", re.MULTILINE)
-STATUS_BRANCH = re.compile(r"^- Branch:\s*(.+?)\s*$", re.MULTILINE)
-STATUS_STATE = re.compile(r"^- State:\s*(implementing|testing|complete|failed)\s*$", re.MULTILINE)
+QUEUE_TASK_START = re.compile(
+    r"^###\s+<task>\s+\[(Pending|WIP|Done)\]\s+"
+    r"\[(Unapproved|Approved)\]\s+(.+?)\s*$", re.MULTILINE
+)
+QUEUE_METADATA = re.compile(r"^- ([A-Za-z-]+):\s*(.*?)\s*$", re.MULTILINE)
+UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+QUEUE_LOCK = threading.RLock()
+CONTROLLER_LOG: Path | None = None
+LOG_LISTENERS: list[Callable[[str], None]] = []
 
 
 class Dashboard:
@@ -167,6 +189,14 @@ DASHBOARD = Dashboard()
 
 def log(message: str) -> None:
     DASHBOARD.message(message)
+    rendered = f"[{dt.datetime.now(dt.timezone.utc).strftime(UTC_FORMAT)}] {message}"
+    with QUEUE_LOCK:
+        if CONTROLLER_LOG is not None:
+            CONTROLLER_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with CONTROLLER_LOG.open("a", encoding="utf-8") as stream:
+                stream.write(rendered + "\n")
+        for listener in list(LOG_LISTENERS):
+            listener(rendered)
 
 
 def run(
@@ -175,6 +205,7 @@ def run(
     cwd: Path | None = None,
     input_text: str | None = None,
     check: bool = True,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         list(args),
@@ -183,6 +214,7 @@ def run(
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
     )
     if check and result.returncode:
         detail = (result.stderr or result.stdout).strip()
@@ -376,6 +408,221 @@ def task_branch_name(task: Task) -> str:
     return f"{BRANCH_PREFIX}{slug}-{task_fingerprint(task)[:8]}"
 
 
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime(UTC_FORMAT)
+
+
+def task_log_path(logs_dir: Path, branch: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", branch).strip(".-") or "task"
+    return logs_dir / f"{safe}_log.md"
+
+
+def append_task_log(path: Path, event: str, note: str = "") -> None:
+    with QUEUE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        heading = "# Tokenshare Task Log\n" if not path.exists() else ""
+        entry = f"\n## {utc_now()}\n\n- Event: {event}\n"
+        if note:
+            entry += f"- Note: {note.replace(chr(10), ' ')}\n"
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(heading + entry)
+
+
+def queue_path(workspace: Path) -> Path:
+    return workspace / "logs" / "tokenshare_agent_tasklist.md"
+
+
+def parse_queue(text: str) -> list[QueueTask]:
+    tasks: list[QueueTask] = []
+    cursor = 0
+    while True:
+        match = QUEUE_TASK_START.search(text, cursor)
+        if match is None:
+            break
+        end = TASK_END.search(text, match.end())
+        if end is None:
+            raise TokenshareError(f"Local task {match.group(3)!r} has no closing marker")
+        block_end = end.end()
+        if text[block_end:block_end + 2] == "\r\n":
+            block_end += 2
+        elif text[block_end:block_end + 1] == "\n":
+            block_end += 1
+        block = text[match.start():block_end]
+        metadata = dict(QUEUE_METADATA.findall(block))
+        required = {
+            "Task-Number", "Task-ID", "Source-Repo", "Source-URL", "Author",
+            "Source-Commit", "Imported-At", "Branch",
+        }
+        missing = sorted(required - metadata.keys())
+        if missing:
+            raise TokenshareError(
+                f"Local task {match.group(3)!r} missing metadata: {', '.join(missing)}"
+            )
+        try:
+            number = int(metadata["Task-Number"])
+        except ValueError as exc:
+            raise TokenshareError("Task-Number must be an integer") from exc
+        tasks.append(QueueTask(
+            number, metadata["Task-ID"], match.group(1), match.group(2),
+            match.group(3).strip(), block, metadata["Source-Repo"],
+            metadata["Source-URL"], metadata["Author"], metadata["Source-Commit"],
+            metadata["Imported-At"], metadata["Branch"],
+        ))
+        cursor = block_end
+    numbers = [task.number for task in tasks]
+    if len(numbers) != len(set(numbers)):
+        raise TokenshareError("Duplicate local task numbers")
+    return tasks
+
+
+def render_queue(tasks: Sequence[QueueTask]) -> str:
+    lines = ["# Tokenshare Agent Tasklist", ""]
+    for state, heading in (("Pending", "Pending Tasks"), ("WIP", "WIP Tasks"),
+                           ("Done", "Completed Tasks")):
+        lines.extend([f"## {heading}", ""])
+        for task in sorted((item for item in tasks if item.state == state),
+                           key=lambda item: item.number):
+            original_lines = task.body.splitlines()
+            body_start = next(
+                (index + 1 for index, line in enumerate(original_lines)
+                 if line.startswith("- Branch:")),
+                1,
+            )
+            payload = original_lines[body_start:]
+            while payload and not payload[-1].strip():
+                payload = payload[:-1]
+            if payload and payload[-1].strip() == "### </task>":
+                payload = payload[:-1]
+            lines.extend([
+                f"### <task> [{task.state}] [{task.approval}] {task.title}",
+                f"- Task-Number: {task.number}",
+                f"- Task-ID: {task.task_id}",
+                f"- Source-Repo: {task.repo_name}",
+                f"- Source-URL: {task.repo_url}",
+                f"- Author: {task.author}",
+                f"- Source-Commit: {task.source_commit}",
+                f"- Imported-At: {task.imported_at}",
+                f"- Branch: {task.branch}",
+                *payload,
+                "### </task>", "",
+            ])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def save_queue(path: Path, tasks: Sequence[QueueTask]) -> None:
+    with QUEUE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(render_queue(tasks), encoding="utf-8")
+        temporary.replace(path)
+
+
+def load_queue(path: Path) -> list[QueueTask]:
+    if not path.exists():
+        save_queue(path, [])
+    return parse_queue(path.read_text(encoding="utf-8"))
+
+
+def queue_task_from_remote(
+    number: int, task: Task, repo: Path, source_url: str, source_commit: str,
+    author: str,
+) -> QueueTask:
+    payload = "\n".join(task.body.splitlines()[1:-1]).strip()
+    branch = task_branch_name(task)
+    metadata_body = "\n".join([
+        f"### <task> [Pending] [Unapproved] {task.title}",
+        f"- Task-Number: {number}", f"- Task-ID: {task_fingerprint(task)}",
+        f"- Source-Repo: {repo.name}", f"- Source-URL: {source_url}",
+        f"- Author: {author}", f"- Source-Commit: {source_commit}",
+        f"- Imported-At: {utc_now()}", f"- Branch: {branch}",
+        payload, "### </task>", "",
+    ])
+    return QueueTask(number, task_fingerprint(task), "Pending", "Unapproved",
+                     task.title, metadata_body, repo.name, source_url, author,
+                     source_commit, utc_now(), branch)
+
+
+def parse_approval_selector(expression: str, eligible: set[int]) -> set[int]:
+    value = expression.strip().lower()
+    if not value:
+        raise TokenshareError("approve requires task numbers or 'all'")
+    excluded = False
+    if value == "all":
+        return set(eligible)
+    if value.startswith("all not "):
+        excluded = True
+        value = value[8:].strip()
+    elif value.startswith("all"):
+        raise TokenshareError("expected 'approve all' or 'approve all not <numbers>'")
+    selected: set[int] = set()
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            raise TokenshareError("empty task selector")
+        if ":" in token:
+            parts = token.split(":")
+            if len(parts) != 2 or not all(part.isdigit() for part in parts):
+                raise TokenshareError(f"invalid task range: {token}")
+            start, end = map(int, parts)
+            if start > end:
+                raise TokenshareError(f"descending task range: {token}")
+            selected.update(range(start, end + 1))
+        elif token.isdigit():
+            selected.add(int(token))
+        else:
+            raise TokenshareError(f"invalid task number: {token}")
+    return set(eligible) - selected if excluded else selected
+
+
+def approve_tasks(path: Path, expression: str, logs_dir: Path) -> list[int]:
+    with QUEUE_LOCK:
+        tasks = load_queue(path)
+        eligible = {task.number for task in tasks
+                    if task.state == "Pending" and task.approval == "Unapproved"}
+        selected = parse_approval_selector(expression, eligible)
+        unknown = selected - eligible
+        if unknown:
+            raise TokenshareError(
+                "not eligible for approval: " + ", ".join(map(str, sorted(unknown)))
+            )
+        for task in tasks:
+            if task.number in selected:
+                task.approval = "Approved"
+                append_task_log(task_log_path(logs_dir, task.branch), "approved",
+                                f"Task #{task.number} approved by local operator")
+        save_queue(path, tasks)
+    return sorted(selected)
+
+
+def update_queue_task(path: Path, task_id: str, *, state: str | None = None,
+                      approval: str | None = None) -> None:
+    with QUEUE_LOCK:
+        tasks = load_queue(path)
+        matching = next((task for task in tasks if task.task_id == task_id), None)
+        if matching is None:
+            return
+        if state is not None:
+            matching.state = state
+        if approval is not None:
+            matching.approval = approval
+        save_queue(path, tasks)
+
+
+def format_queue_view(tasks: Sequence[QueueTask]) -> str:
+    priority = {("Pending", "Unapproved"): 0, ("Pending", "Approved"): 1,
+                ("WIP", "Approved"): 2, ("Done", "Approved"): 3}
+    ordered = sorted(tasks, key=lambda task: (priority.get((task.state, task.approval), 9),
+                                              task.number))
+    header = "#  State    Approval    Repository          Author               Title"
+    rows = [header, "-" * len(header)]
+    for task in ordered:
+        rows.append(
+            f"{task.number:<3}{task.state:<9}{task.approval:<12}"
+            f"{task.repo_name[:18]:<20}{task.author[:19]:<21}{task.title}"
+        )
+    return "\n".join(rows) if ordered else "No tasks have been imported."
+
+
 def default_branch(repo: Path) -> str:
     result = run(
         ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
@@ -414,11 +661,12 @@ def load_state(path: Path) -> dict:
 
 
 def save_state(path: Path, state: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.chmod(0o600)
-    temporary.replace(path)
+    with QUEUE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.chmod(0o600)
+        temporary.replace(path)
 
 
 def repository_state(state: dict, repo: Path) -> dict:
@@ -452,28 +700,20 @@ def remote_managed_branches(repo: Path) -> list[ManagedBranch]:
         branch = ref.removeprefix("origin/")
         if not branch.startswith(BRANCH_PREFIX):
             continue
-        paths = run(
-            ["git", "ls-tree", "-r", "--name-only", ref, "--", "docs"], cwd=repo
-        ).stdout.splitlines()
-        for raw_path in reversed(sorted(paths)):
-            if not re.fullmatch(r"docs/status_.*\.md", raw_path):
-                continue
-            content = run(["git", "show", f"{ref}:{raw_path}"], cwd=repo).stdout
-            id_match = STATUS_TASK_ID.search(content)
-            title_match = STATUS_TASK.search(content)
-            branch_match = STATUS_BRANCH.search(content)
-            states = STATUS_STATE.findall(content)
-            if not (id_match and title_match and branch_match and states):
-                continue
-            if branch_match.group(1) != branch:
-                continue
-            records.append(
-                ManagedBranch(
-                    branch, id_match.group(1), title_match.group(1), states[-1],
-                    repo / raw_path, head,
-                )
-            )
-            break
+        paths = run(["git", "ls-tree", "-r", "--name-only", ref], cwd=repo).stdout.splitlines()
+        raw_path = next((path for path in ("tokenshare_tasklist.md",
+                                            "docs/tokenshare_tasklist.md")
+                         if path in paths), None)
+        if raw_path is None:
+            continue
+        content = run(["git", "show", f"{ref}:{raw_path}"], cwd=repo).stdout
+        candidates = [task for task in parse_tasks(content) if task.state in {"WIP", "Done"}]
+        matching = next((task for task in candidates if task_branch_name(task) == branch), None)
+        if matching is not None:
+            records.append(ManagedBranch(
+                branch, task_fingerprint(matching), matching.title,
+                "complete" if matching.state == "Done" else "implementing", None, head,
+            ))
     return records
 
 
@@ -500,6 +740,8 @@ def reconcile_deleted_branches(
     current = {record.name for record in remote}
     changed = False
     for task_id, entry in repository_state(state, repo).items():
+        if not isinstance(entry, dict):
+            continue
         if entry.get("status") != "published" or entry.get("branch") in current:
             continue
         matching = next((task for task in tasks if task.title == entry.get("title")), None)
@@ -538,7 +780,7 @@ def transition_task(text: str, task: Task, target_state: str) -> str:
     return prefix + updated + ("\n" if suffix else "") + suffix
 
 
-def write_status(
+def write_task_log(
     path: Path,
     task: Task,
     state: str,
@@ -552,7 +794,7 @@ def write_status(
     path.parent.mkdir(parents=True, exist_ok=True)
     now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     existing = path.read_text(encoding="utf-8") if path.exists() else (
-        f"# Tokenshare Task Status\n\n- Task: {task.title}\n"
+        f"# Tokenshare Task Log\n\n- Task: {task.title}\n"
         f"- Task-ID: {task_id or task_fingerprint(task)}\n"
         f"- Branch: {branch or task_branch_name(task)}\n"
     )
@@ -560,7 +802,7 @@ def write_status(
     if note:
         entry += f"- Note: {note.replace(chr(10), ' ')}\n"
     path.write_text(existing + entry, encoding="utf-8")
-    detail = f"status.md: {state}"
+    detail = f"task log: {state}"
     if note:
         detail += f" — {note.replace(chr(10), ' ')}"
     log(detail)
@@ -608,7 +850,7 @@ There is no human interface. Do not ask questions. Use the task alone, inspect r
 instructions, and make the smallest reasonable assumptions needed to finish.
 
 Phase: {phase}
-Status file: {status_path}
+Task log: {status_path}
 
 {task.body.rstrip()}
 
@@ -652,12 +894,15 @@ def _agent_args(
     if not args:
         raise TokenshareError("Agent command is empty")
     kind = _agent_kind(args[0])
+    is_native = Path(args[0]).name in {"codex", "claude", "opencode"}
     if kind == "codex":
         escaped_repo = str(repo.resolve()).replace("\\", "\\\\").replace('"', '\\"')
         args.extend(["--config", f'projects."{escaped_repo}".trust_level="trusted"'])
-    elif kind == "claude" and "--dangerously-skip-permissions" not in args:
+        if is_native and "--dangerously-bypass-approvals-and-sandbox" not in args:
+            args.append("--dangerously-bypass-approvals-and-sandbox")
+    elif kind == "claude" and is_native and "--dangerously-skip-permissions" not in args:
         args.append("--dangerously-skip-permissions")
-    elif kind == "opencode" and "--auto" not in args:
+    elif kind == "opencode" and is_native and "--auto" not in args:
         args.append("--auto")
     if resume and kind == "codex":
         return [*args, "resume", "--last", prompt]
@@ -695,7 +940,7 @@ def resolve_agent_command(agent: str | None, agent_command: str) -> str:
     return shlex.quote(str(stub))
 
 
-def _new_status_entries(path: Path, previous: str) -> tuple[str, list[str]]:
+def _new_log_entries(path: Path, previous: str) -> tuple[str, list[str]]:
     current = path.read_text(encoding="utf-8") if path.exists() else ""
     if current == previous:
         return current, []
@@ -834,8 +1079,9 @@ class AgentAttachment:
         elif self.process is not None and self.process.poll() is not None:
             returncode = self.process.returncode
             if returncode:
-                raise AttachmentError(
-                    f"tmux attachment on {self.target.path} exited with status {returncode}"
+                log(
+                    f"tmux attachment on {self.target.path} exited with status {returncode}; "
+                    "agent monitoring continues"
                 )
             # A normal return here means the user manually detached. Monitoring continues.
             self._release_terminal()
@@ -892,7 +1138,7 @@ def _run_agent_once(
         {
             "TOKENSHARE_TASK_TITLE": task.title,
             "TOKENSHARE_TASK_STATE": phase,
-            "TOKENSHARE_STATUS_FILE": str(status_path),
+            "TOKENSHARE_TASK_LOG": str(status_path),
         }
     )
     if _agent_kind(args[0]) == "opencode":
@@ -913,7 +1159,7 @@ def _run_agent_once(
             "tmux", "respawn-pane", "-k", "-t", session, "-c", str(repo),
             "-e", f"TOKENSHARE_TASK_TITLE={task.title}",
             "-e", f"TOKENSHARE_TASK_STATE={phase}",
-            "-e", f"TOKENSHARE_STATUS_FILE={status_path}",
+            "-e", f"TOKENSHARE_TASK_LOG={status_path}",
         ]
         if "OPENCODE_PERMISSION" in env:
             tmux_args.extend(["-e", f"OPENCODE_PERMISSION={env['OPENCODE_PERMISSION']}"])
@@ -940,9 +1186,9 @@ def _run_agent_once(
                 if state.returncode:
                     raise TokenshareError(f"tmux agent session {session!r} disappeared")
                 values = state.stdout.strip().split()
-                previous, entries = _new_status_entries(status_path, previous)
+                previous, entries = _new_log_entries(status_path, previous)
                 for entry in entries:
-                    log(f"status.md: {entry}")
+                    log(f"task log: {entry}")
                 DASHBOARD.refresh()
                 if phase_completion_marker(phase) in previous:
                     log(f"Agent reported {phase} phase complete")
@@ -950,6 +1196,17 @@ def _run_agent_once(
                     break
                 if values and values[0] == "1":
                     returncode = int(values[1]) if len(values) > 1 else 1
+                    if returncode:
+                        captured = run(
+                            ["tmux", "capture-pane", "-p", "-S", "-120", "-t", session],
+                            check=False,
+                        ).stdout.strip()
+                        diagnostic = captured[-4000:] if captured else "No pane output captured"
+                        append_task_log(
+                            status_path, "agent-exit",
+                            f"Exit status {returncode}; pane output: {diagnostic}",
+                        )
+                        log(f"Agent pane exited with status {returncode}: {diagnostic}")
                     break
                 time.sleep(1)
         finally:
@@ -1012,13 +1269,106 @@ def run_agent(
         _retry_wait(delay)
 
 
-def status_filename(repo: Path) -> Path:
-    timestamp = dt.datetime.now()
-    candidate = repo / "docs" / f"status_{timestamp.strftime('%Y-%m-%d_%H-%M-%S')}.md"
-    while candidate.exists():
-        timestamp += dt.timedelta(seconds=1)
-        candidate = repo / "docs" / f"status_{timestamp.strftime('%Y-%m-%d_%H-%M-%S')}.md"
-    return candidate
+def task_author(repo: Path, tasklist: Path, task: Task, ref: str) -> str:
+    relative = str(tasklist.relative_to(repo))
+    wanted = task_fingerprint(task)
+    commits = run(["git", "log", "--reverse", "--format=%H", ref, "--", relative],
+                  cwd=repo, check=False).stdout.splitlines()
+    introducing = commits[-1] if commits else ref
+    for commit in commits:
+        snapshot = run(["git", "show", f"{commit}:{relative}"], cwd=repo, check=False)
+        if snapshot.returncode:
+            continue
+        try:
+            fingerprints = {task_fingerprint(item) for item in parse_tasks(snapshot.stdout)}
+        except TokenshareError:
+            continue
+        if wanted in fingerprints:
+            introducing = commit
+            break
+    result = run(["git", "show", "-s", "--format=%an <%ae>", introducing],
+                 cwd=repo, check=False)
+    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else "Unknown"
+
+
+def intake_remote_tasks(
+    repo: Path, path: Path, state: dict, state_path: Path, logs_dir: Path
+) -> tuple[int, int]:
+    """Import remote Pending tasks and revoke stale unstarted snapshots."""
+    switch_to_default(repo)
+    tasklist = find_tasklist(repo)
+    tasks = parse_tasks(tasklist.read_text(encoding="utf-8"))
+    pending = [task for task in tasks if task.state == "Pending"]
+    current_ids = {task_fingerprint(task) for task in pending}
+    source_url = run(["git", "remote", "get-url", "origin"], cwd=repo).stdout.strip()
+    source_commit = run(["git", "rev-parse", f"origin/{default_branch(repo)}"],
+                        cwd=repo).stdout.strip()
+    with QUEUE_LOCK:
+        local = load_queue(path)
+        source_state = state.setdefault("sources", {}).setdefault(source_url, {})
+        previous_commit = source_state.get("last_inspected_commit")
+        remote_changed = previous_commit != source_commit
+        if previous_commit and remote_changed:
+            relative = str(tasklist.relative_to(repo))
+            diff = run(["git", "diff", "--quiet", previous_commit, source_commit,
+                        "--", relative], cwd=repo, check=False)
+            remote_changed = diff.returncode != 0
+        retained: list[QueueTask] = []
+        revoked = 0
+        for item in local:
+            if (item.repo_url == source_url and item.state == "Pending"
+                    and item.task_id not in current_ids):
+                revoked += 1
+                append_task_log(task_log_path(logs_dir, item.branch), "approval-revoked",
+                                "Remote Pending task was edited or removed")
+                log(f"Revoked stale task #{item.number}: {item.title}")
+            else:
+                retained.append(item)
+        local = retained
+        known = {item.task_id for item in local}
+        repo_data = repository_state(state, repo)
+        repo_data.pop("seen_task_ids", None)
+        repo_data.pop("last_inspected_commit", None)
+        seen = set(source_state.get("seen_task_ids", []))
+        next_number = int(state.get("next_task_number", 1))
+        imported = 0
+        for task in pending if remote_changed else []:
+            task_id = task_fingerprint(task)
+            if task_id in known or task_id in seen:
+                continue
+            item = queue_task_from_remote(
+                next_number, task, repo, source_url, source_commit,
+                task_author(repo, tasklist, task, f"origin/{default_branch(repo)}"),
+            )
+            local.append(item)
+            next_number += 1
+            imported += 1
+            task_log = task_log_path(logs_dir, item.branch)
+            append_task_log(task_log, "remote-push",
+                            f"Commit {source_commit}; author {item.author}")
+            append_task_log(task_log, "remote-diff-detected", source_url)
+            append_task_log(task_log, "imported-unapproved",
+                            f"Task #{item.number} copied to {path}")
+            append_task_log(task_log, "review-notification", "Ready for code-editor review")
+            log(f"New unapproved task #{item.number}: {repo.name} — {task.title}")
+            seen.add(task_id)
+        managed = {record.task_id: record for record in remote_managed_branches(repo)}
+        for item in local:
+            record = managed.get(item.task_id)
+            if record is None:
+                continue
+            migrated_state = "Done" if record.state == "complete" else "WIP"
+            if item.state != migrated_state or item.approval != "Approved":
+                item.state = migrated_state
+                item.approval = "Approved"
+                append_task_log(task_log_path(logs_dir, item.branch), "managed-branch-recovered",
+                                f"Recovered {migrated_state} from origin/{record.name}")
+        state["next_task_number"] = next_number
+        source_state["seen_task_ids"] = sorted(seen)
+        source_state["last_inspected_commit"] = source_commit
+        save_queue(path, local)
+        save_state(state_path, state)
+    return imported, revoked
 
 
 def process_task(
@@ -1031,11 +1381,14 @@ def process_task(
     existing: ManagedBranch | None = None,
     use_tmux: bool = True,
     auto_attach: AttachTarget | None = None,
+    logs_dir: Path | None = None,
+    local_queue: Path | None = None,
 ) -> None:
     DASHBOARD.set_task(repo, task.title)
     branch = existing.name if existing else task_branch_name(task)
     task_id = existing.task_id if existing else task_fingerprint(task)
     if existing:
+        status_path = task_log_path(logs_dir or repo.parent / "logs", branch)
         log(f"Resuming {repo.name}: {task.title} on {branch}")
         current = run(["git", "branch", "--show-current"], cwd=repo).stdout.strip()
         dirty = run(["git", "status", "--porcelain"], cwd=repo).stdout.strip()
@@ -1076,7 +1429,7 @@ def process_task(
             if any(item.title == task.title and item.state == "Done" for item in branch_tasks):
                 completed_task = next(item for item in branch_tasks if item.title == task.title)
                 if run(["git", "status", "--porcelain"], cwd=repo).stdout.strip():
-                    write_status(
+                    write_task_log(
                         status_path, completed_task, "complete",
                         task_id=task_id, branch=branch,
                     )
@@ -1086,11 +1439,12 @@ def process_task(
                 remember_branch(
                     state, state_path, repo, completed_task, branch, head
                 )
+                if local_queue is not None:
+                    update_queue_task(local_queue, task_id, state="Done", approval="Approved")
                 log(f"Task branch already complete: {branch}")
                 DASHBOARD.set_task(None)
                 return
             raise TokenshareError(f"Managed branch {branch} has no WIP task {task.title!r}")
-        status_path = existing.status_path
     else:
         log(f"Claiming {repo.name}: {task.title} on {branch}")
         ensure_clean(repo)
@@ -1101,15 +1455,17 @@ def process_task(
             item for item in parse_tasks(tasklist.read_text(encoding="utf-8"))
             if item.title == task.title and item.state == "Pending"
         )
-        status_path = status_filename(repo)
-        write_status(
+        status_path = task_log_path(logs_dir or repo.parent / "logs", branch)
+        write_task_log(
             status_path, task, "implementing", task_id=task_id, branch=branch
         )
         text = tasklist.read_text(encoding="utf-8")
         tasklist.write_text(transition_task(text, task, "WIP"), encoding="utf-8")
-        git_commit_push(repo, [tasklist, status_path], f"tokenshare: claim {task.title}")
+        git_commit_push(repo, [tasklist], f"tokenshare: claim {task.title}")
         head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
         remember_branch(state, state_path, repo, task, branch, head)
+        if local_queue is not None:
+            update_queue_task(local_queue, task_id, state="WIP", approval="Approved")
         wip_task = next(
             item for item in parse_tasks(tasklist.read_text(encoding="utf-8"))
             if item.state == "WIP" and item.title == task.title
@@ -1124,15 +1480,14 @@ def process_task(
             )
             status_text = status_path.read_text(encoding="utf-8")
         if "- State: testing" not in status_text:
-            write_status(status_path, wip_task, "testing", task_id=task_id, branch=branch)
-            git_commit_push(repo, [status_path], f"tokenshare: test {task.title}")
+            write_task_log(status_path, wip_task, "testing", task_id=task_id, branch=branch)
             status_text = status_path.read_text(encoding="utf-8")
         if phase_completion_marker("testing") not in status_text:
             run_agent(
                 repo, agent_command, wip_task, status_path, "testing",
                 use_tmux=use_tmux, auto_attach=auto_attach,
             )
-        write_status(
+        write_task_log(
             status_path, wip_task, "complete", task_id=task_id, branch=branch
         )
         current = tasklist.read_text(encoding="utf-8")
@@ -1146,14 +1501,13 @@ def process_task(
         run(["git", "push", "-u", "origin", "HEAD"], cwd=repo)
         head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
         remember_branch(state, state_path, repo, task, branch, head)
+        append_task_log(status_path, "branch-published", f"origin/{branch} at {head}")
+        if local_queue is not None:
+            update_queue_task(local_queue, task_id, state="Done", approval="Approved")
     except Exception as exc:
-        write_status(
+        write_task_log(
             status_path, wip_task, "failed", str(exc), task_id=task_id, branch=branch
         )
-        try:
-            git_commit_push(repo, [status_path], f"tokenshare: record failure for {task.title}")
-        except Exception as record_error:
-            log(f"Could not push failure status: {record_error}")
         raise
     log(f"Completed {repo.name}: {task.title}; review branch {branch}")
     DASHBOARD.set_task(None)
@@ -1167,6 +1521,8 @@ def scan_repositories(
     state_path: Path,
     use_tmux: bool = True,
     auto_attach: AttachTarget | None = None,
+    logs_dir: Path | None = None,
+    local_queue: Path | None = None,
 ) -> int:
     completed = 0
     while True:
@@ -1189,6 +1545,7 @@ def scan_repositories(
                 process_task(
                     repo, branch_task, agent_command, state=state, state_path=state_path,
                     existing=record, use_tmux=use_tmux, auto_attach=auto_attach,
+                    logs_dir=logs_dir, local_queue=local_queue,
                 )
                 completed += 1
                 progressed = True
@@ -1237,6 +1594,7 @@ def scan_repositories(
                 process_task(
                     repo, branch_task, agent_command, state=state, state_path=state_path,
                     existing=incomplete, use_tmux=use_tmux, auto_attach=auto_attach,
+                    logs_dir=logs_dir, local_queue=local_queue,
                 )
                 completed += 1
                 progressed = True
@@ -1247,18 +1605,24 @@ def scan_repositories(
             active_ids = {record.task_id for record in active}
             declined = {
                 task_id for task_id, entry in repository_state(state, repo).items()
-                if entry.get("status") == "declined"
+                if isinstance(entry, dict) and entry.get("status") == "declined"
             }
-            pending = next(
-                (task for task in tasks if task.state == "Pending"
-                 and task_fingerprint(task) not in active_ids | declined),
-                None,
-            )
+            approved_ids = None
+            if local_queue is not None:
+                approved_ids = {
+                    item.task_id for item in load_queue(local_queue)
+                    if item.state == "Pending" and item.approval == "Approved"
+                }
+            pending = next((task for task in tasks if task.state == "Pending"
+                            and task_fingerprint(task) not in active_ids | declined
+                            and (approved_ids is None or task_fingerprint(task) in approved_ids)),
+                           None)
             if pending is None:
                 continue
             process_task(
                 repo, pending, agent_command, state=state, state_path=state_path,
                 use_tmux=use_tmux, auto_attach=auto_attach,
+                logs_dir=logs_dir, local_queue=local_queue,
             )
             completed += 1
             progressed = True
@@ -1318,7 +1682,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agent_group.add_argument(
         "--agent-command",
-        default=os.environ.get("TOKENSHARE_AGENT_COMMAND", "codex --full-auto"),
+        default=os.environ.get(
+            "TOKENSHARE_AGENT_COMMAND", "codex --dangerously-bypass-approvals-and-sandbox"
+        ),
         help="Raw native agent command (advanced override)",
     )
     parser.add_argument(
@@ -1326,7 +1692,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=float(os.environ.get("TOKENSHARE_POLL_SECONDS", "60")),
     )
-    parser.add_argument("--once", action="store_true", help="Drain current Pending tasks and exit")
+    parser.add_argument(
+        "-ni", "--non-interactive-mode", action="store_true",
+        help="Synchronize, drain already-approved tasks, and exit",
+    )
+    parser.add_argument(
+        "--workers", type=int,
+        default=int(os.environ.get("TOKENSHARE_WORKERS", "1")),
+        help="Maximum tasks running across different repositories (default: 1)",
+    )
     parser.add_argument(
         "--no-tmux", action="store_true",
         help="Run the agent directly (mainly useful for tests and noninteractive automation)",
@@ -1342,47 +1716,202 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+class ControllerRuntime:
+    def __init__(self, args: argparse.Namespace, agent_command: str,
+                 auto_attach: AttachTarget | None) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.args = args
+        self.agent_command = agent_command
+        self.auto_attach = auto_attach
+        self.workspace = args.workspace.expanduser().resolve()
+        self.logs_dir = self.workspace / "logs"
+        self.queue_file = queue_path(self.workspace)
+        self.state_path = Path(os.environ.get(
+            "TOKENSHARE_STATE", Path.home() / ".config" / "tokenshare" / "state.json"
+        )).expanduser()
+        self.state = load_state(self.state_path)
+        self.urls = read_repo_urls(args.config.expanduser().resolve())
+        names = [repo_name(url) for url in self.urls]
+        if len(names) != len(set(names)):
+            raise TokenshareError("Configured repositories must have unique repository names")
+        self.executor = ThreadPoolExecutor(max_workers=args.workers,
+                                           thread_name_prefix="tokenshare-worker")
+        self.repos: dict[str, Path] = {}
+        self.active: dict[str, object] = {}
+        self.blocked_until: dict[str, float] = {}
+        self.started = time.monotonic()
+        self.idle_since = self.started
+        self.stop_event = threading.Event()
+        self.wake_event = threading.Event()
+        self.last_error: Exception | None = None
+        self.thread: threading.Thread | None = None
+
+    def _worker(self, repo: Path) -> int:
+        return scan_repositories(
+            [repo], self.agent_command, state=self.state, state_path=self.state_path,
+            use_tmux=not self.args.no_tmux, auto_attach=self.auto_attach,
+            logs_dir=self.logs_dir, local_queue=self.queue_file,
+        )
+
+    def cycle(self) -> bool:
+        progressed = False
+        for name, future in list(self.active.items()):
+            if not future.done():
+                continue
+            del self.active[name]
+            try:
+                count = future.result()
+                progressed = bool(count) or progressed
+                if not count:
+                    self.blocked_until[name] = time.monotonic() + self.args.poll_seconds
+            except Exception as exc:
+                self.last_error = exc
+                log(f"ERROR processing {name}: {exc}")
+            if not self.active:
+                self.idle_since = time.monotonic()
+        for url in self.urls:
+            name = repo_name(url)
+            if name in self.active:
+                continue
+            try:
+                log(f"Checking repository {name}")
+                repo = sync_repo(url, self.workspace)
+                self.repos[name] = repo
+                imported, revoked = intake_remote_tasks(
+                    repo, self.queue_file, self.state, self.state_path, self.logs_dir
+                )
+                progressed = bool(imported or revoked) or progressed
+                if imported or revoked:
+                    self.blocked_until.pop(name, None)
+            except Exception as exc:
+                self.last_error = exc
+                log(f"ERROR checking {name}: {exc}")
+        available = self.args.workers - len(self.active)
+        if available > 0:
+            approved_repos = {
+                task.repo_name for task in load_queue(self.queue_file)
+                if task.state == "Pending" and task.approval == "Approved"
+            }
+            for name in sorted(approved_repos):
+                if (available <= 0 or name in self.active or name not in self.repos
+                        or self.blocked_until.get(name, 0) > time.monotonic()):
+                    continue
+                self.active[name] = self.executor.submit(self._worker, self.repos[name])
+                available -= 1
+                progressed = True
+        return progressed
+
+    def run_background(self) -> None:
+        while not self.stop_event.is_set():
+            self.cycle()
+            self.wake_event.wait(self.args.poll_seconds)
+            self.wake_event.clear()
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self.run_background,
+                                       name="tokenshare-controller", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.wake_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=max(1.0, self.args.poll_seconds + 1))
+        self.executor.shutdown(wait=True)
+
+    def toolbar(self) -> str:
+        now = time.monotonic()
+        uptime = Dashboard._duration(now - self.started)
+        idle = Dashboard._duration(0 if self.active else now - self.idle_since)
+        active = ", ".join(sorted(self.active)) or "none"
+        return f" active: {active} | workers: {len(self.active)}/{self.args.workers} | uptime: {uptime} | idle: {idle} "
+
+
+def handle_controller_command(command: str, runtime: ControllerRuntime,
+                              output: Callable[[str], None] = print) -> bool:
+    value = command.strip()
+    if not value:
+        return True
+    if value == "view":
+        tasks = load_queue(runtime.queue_file)
+        output(format_queue_view(tasks))
+        for task in tasks:
+            if task.state == "Pending" and task.approval == "Unapproved":
+                append_task_log(task_log_path(runtime.logs_dir, task.branch), "viewed-in-tui")
+        return True
+    if value.startswith("approve "):
+        approved = approve_tasks(runtime.queue_file, value[8:], runtime.logs_dir)
+        output("Approved: " + (", ".join(map(str, approved)) if approved else "none"))
+        runtime.wake_event.set()
+        return True
+    if value == "help":
+        output("Commands: view | approve 1,3,7 | approve 1:9,11:15 | "
+               "approve all | approve all not 1,3 | help | quit")
+        return True
+    if value in {"quit", "exit"}:
+        return False
+    raise TokenshareError(f"Unknown command: {value}")
+
+
+def run_tui(runtime: ControllerRuntime) -> int:
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.patch_stdout import patch_stdout
+    except ImportError as exc:
+        raise TokenshareError(
+            "prompt_toolkit is required; rerun install.py or install prompt_toolkit"
+        ) from exc
+    session = PromptSession(bottom_toolbar=runtime.toolbar, refresh_interval=1.0)
+    runtime.start()
+    try:
+        with patch_stdout(raw=True):
+            print("Tokenshare controller — type 'help' for commands")
+            print(format_queue_view(load_queue(runtime.queue_file)))
+            while True:
+                try:
+                    command = session.prompt("tokenshare> ")
+                except (EOFError, KeyboardInterrupt):
+                    break
+                try:
+                    if not handle_controller_command(command, runtime):
+                        break
+                except TokenshareError as exc:
+                    print(f"ERROR: {exc}")
+    finally:
+        runtime.stop()
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    global CONTROLLER_LOG
     args = build_parser().parse_args(argv)
     if args.poll_seconds <= 0:
         raise TokenshareError("--poll-seconds must be greater than zero")
+    if args.workers <= 0:
+        raise TokenshareError("--workers must be greater than zero")
     if args.no_tmux and args.auto_attach:
         raise TokenshareError("--auto-attach cannot be used with --no-tmux")
-    auto_attach = resolve_attach_target(args.auto_attach)
     agent_command = resolve_agent_command(args.agent, args.agent_command)
-    state_path = Path(
-        os.environ.get(
-            "TOKENSHARE_STATE",
-            Path.home() / ".config" / "tokenshare" / "state.json",
-        )
-    ).expanduser()
-    state = load_state(state_path)
-    urls = read_repo_urls(args.config.expanduser().resolve())
-    names = [repo_name(url) for url in urls]
-    if len(names) != len(set(names)):
-        raise TokenshareError("Configured repositories must have unique repository names")
-
-    while True:
-        repos = []
-        for url in urls:
-            log(f"Checking repository {repo_name(url)}")
-            repos.append(sync_repo(url, args.workspace.expanduser().resolve()))
-        completed = scan_repositories(
-            repos,
-            agent_command,
-            state=state,
-            state_path=state_path,
-            use_tmux=not args.no_tmux,
-            auto_attach=auto_attach,
-        )
-        if args.once:
-            return 0
-        if not completed:
-            log(f"No Pending tasks; checking again in {args.poll_seconds:g} seconds")
-        deadline = time.monotonic() + args.poll_seconds
-        while time.monotonic() < deadline:
-            DASHBOARD.refresh()
-            time.sleep(min(1, max(0, deadline - time.monotonic())))
+    auto_attach = resolve_attach_target(args.auto_attach)
+    runtime = ControllerRuntime(args, agent_command, auto_attach)
+    DASHBOARD.enabled = False
+    CONTROLLER_LOG = runtime.logs_dir / "tokenshare-controller.log"
+    load_queue(runtime.queue_file)
+    if args.non_interactive_mode:
+        while True:
+            progressed = runtime.cycle()
+            if runtime.last_error is not None:
+                runtime.stop()
+                raise TokenshareError(str(runtime.last_error))
+            if runtime.active:
+                time.sleep(0.1)
+                continue
+            if not progressed:
+                break
+        runtime.stop()
+        return 0
+    return run_tui(runtime)
 
 
 if __name__ == "__main__":
