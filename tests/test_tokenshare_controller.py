@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import dataclasses
 import json
 import os
@@ -56,6 +57,15 @@ class TaskParsingTests(unittest.TestCase):
         self.assertIsNone(args.auto_attach)
         self.assertEqual(args.workers, 1)
         self.assertFalse(args.non_interactive_mode)
+        self.assertFalse(args.dangerously_skip_approvals)
+        self.assertFalse(args.clear_history)
+
+    def test_dangerous_approval_and_clear_history_flags_parse(self):
+        args = controller.build_parser().parse_args([
+            "--dangerously-skip-approvals", "-ch",
+        ])
+        self.assertTrue(args.dangerously_skip_approvals)
+        self.assertTrue(args.clear_history)
 
     def test_installed_defaults_come_from_install_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -113,7 +123,9 @@ class TaskParsingTests(unittest.TestCase):
             validated = controller.validate_attach_target(target)
             self.assertEqual(validated.path, Path("/dev/pts/4"))
         with mock.patch.object(controller, "_tmux_client_for_tty", return_value=None):
-            with self.assertRaisesRegex(controller.AttachmentError, "has no tmux client"):
+            with self.assertRaisesRegex(
+                controller.AttachmentError, "tmux new-session -A -s tokenshare-viewer"
+            ):
                 controller.validate_attach_target(target)
 
     def test_tmux_client_lookup_accepts_outer_or_inner_tty(self):
@@ -399,6 +411,121 @@ class TaskParsingTests(unittest.TestCase):
             self.assertEqual(controller.load_queue(path)[0].approval, "Approved")
             self.assertTrue(controller.task_log_path(root / "logs", item.branch).is_file())
 
+    def test_automatic_approval_is_distinctly_audited(self):
+        remote = controller.parse_tasks(TASKLIST)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue = controller.queue_path(root)
+            item = controller.queue_task_from_remote(
+                1, remote, Path("/tmp/repo"), "remote", "a" * 40, "Owner",
+            )
+            controller.save_queue(queue, [item])
+            logs = controller.repository_logs_path(root)
+            self.assertEqual(
+                controller.approve_tasks(queue, "all", logs, automatic=True), [1]
+            )
+            audit = controller.task_log_path(logs, item.branch).read_text(encoding="utf-8")
+            self.assertIn("Event: auto-approved", audit)
+            self.assertIn("--dangerously-skip-approvals", audit)
+
+    def test_clear_history_preserves_controller_audit_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "config" / "state.json"
+            state.parent.mkdir(parents=True)
+            state.write_text("{}", encoding="utf-8")
+            queue = controller.queue_path(root)
+            queue.parent.mkdir(parents=True)
+            queue.write_text("queue", encoding="utf-8")
+            repo_log = controller.repository_logs_path(root) / "task_log.md"
+            repo_log.parent.mkdir(parents=True)
+            repo_log.write_text("task", encoding="utf-8")
+            audit = controller.controller_log_path(root)
+            audit.write_text("keep", encoding="utf-8")
+            legacy_audit = root / "logs" / "tokenshare-controller.log"
+            legacy_audit.write_text("keep legacy", encoding="utf-8")
+            legacy_task = root / "logs" / "tokenshare-dev-old_log.md"
+            legacy_task.write_text("remove", encoding="utf-8")
+
+            controller.clear_controller_history(root, state)
+
+            self.assertFalse(state.exists())
+            self.assertFalse(queue.exists())
+            self.assertFalse(repo_log.exists())
+            self.assertFalse(legacy_task.exists())
+            self.assertEqual(audit.read_text(encoding="utf-8"), "keep")
+            self.assertEqual(legacy_audit.read_text(encoding="utf-8"), "keep legacy")
+
+            controller.clear_controller_history(root, audit)
+            self.assertEqual(audit.read_text(encoding="utf-8"), "keep")
+
+    def test_clear_history_main_is_silent_and_never_initializes_an_agent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.json"
+            state.write_text("{}", encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            old_dashboard_enabled = controller.DASHBOARD.enabled
+            try:
+                with mock.patch.dict(
+                    os.environ, {"TOKENSHARE_STATE": str(state)}, clear=False
+                ), mock.patch.object(
+                    controller, "resolve_agent_command"
+                ) as resolve_agent, mock.patch.object(
+                    controller, "ControllerRuntime"
+                ) as runtime, mock.patch("sys.stdout", stdout), mock.patch(
+                    "sys.stderr", stderr
+                ):
+                    self.assertEqual(
+                        controller.main(["--workspace", str(root), "-ch"]), 0
+                    )
+            finally:
+                controller.DASHBOARD.enabled = old_dashboard_enabled
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertFalse(state.exists())
+            resolve_agent.assert_not_called()
+            runtime.assert_not_called()
+            self.assertIn(
+                "Clear-history completed",
+                controller.controller_log_path(root).read_text(encoding="utf-8"),
+            )
+
+    def test_task_start_audit_includes_repo_and_queued_author(self):
+        task = controller.parse_tasks(TASKLIST)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue = controller.queue_path(root)
+            queued = controller.queue_task_from_remote(
+                1, task, root / "sample-repo", "remote", "a" * 40,
+                "Task Owner <owner@example.invalid>",
+            )
+            controller.save_queue(queue, [queued])
+            with mock.patch.object(controller, "log") as log_mock, mock.patch.object(
+                controller, "ensure_clean", side_effect=controller.TokenshareError("stop")
+            ), mock.patch.object(
+                controller, "local_managed_branch", return_value=None
+            ), self.assertRaisesRegex(controller.TokenshareError, "stop"):
+                controller.process_task(
+                    root / "sample-repo", task, "agent", state={},
+                    state_path=root / "state.json", use_tmux=False,
+                    logs_dir=controller.repository_logs_path(root), local_queue=queue,
+                )
+            first = log_mock.call_args_list[0].args[0]
+            self.assertIn("repo=sample-repo", first)
+            self.assertIn("author=Task Owner <owner@example.invalid>", first)
+            self.assertIn("mode=claim", first)
+
+    def test_tui_help_uses_cli_style_command_summaries(self):
+        output = []
+        runtime = types.SimpleNamespace()
+        self.assertTrue(controller.handle_controller_command("help", runtime, output.append))
+        rendered = output[0]
+        self.assertIn("usage: COMMAND [ARGS]", rendered)
+        self.assertIn("approve SELECTOR", rendered)
+        self.assertIn("all not SELECTOR", rendered)
+
     def test_log_entry_monitor_deduplicates_rewrites_and_reordering(self):
         first = "## 2026-01-01T00:00:00Z\n\n- Progress: first\n"
         second = "## 2026-01-01T00:01:00Z\n\n- Progress: second\n"
@@ -430,6 +557,7 @@ class TaskParsingTests(unittest.TestCase):
             runtime = types.SimpleNamespace(
                 queue_file=queue,
                 logs_dir=root / "logs",
+                repository_logs_dir=controller.repository_logs_path(root),
                 toolbar=lambda: " active: none | workers: 0/1 | uptime: 00:00:01 ",
             )
             tui = controller.ControllerTUI(
@@ -442,6 +570,27 @@ class TaskParsingTests(unittest.TestCase):
                 self.assertEqual(tui.command_area.text, "approve 1")
                 self.assertIn("background update", tui.log_area.text)
                 self.assertTrue(tui.application.full_screen)
+                tui._set_task_height(1)
+                self.assertEqual(tui.task_height, 4)
+                tui._set_task_height(10_000)
+                self.assertGreaterEqual(tui.task_height, 4)
+                from prompt_toolkit.data_structures import Point
+                from prompt_toolkit.mouse_events import (
+                    MouseButton, MouseEvent, MouseEventType,
+                )
+                window = types.SimpleNamespace(render_info=None)
+                tui.task_height = 10
+                tui._handle_resize_mouse(
+                    MouseEvent(Point(x=0, y=5), MouseEventType.MOUSE_DOWN,
+                               MouseButton.LEFT, frozenset()),
+                    window,
+                )
+                tui._handle_resize_mouse(
+                    MouseEvent(Point(x=0, y=8), MouseEventType.MOUSE_MOVE,
+                               MouseButton.LEFT, frozenset()),
+                    window,
+                )
+                self.assertEqual(tui.task_height, 13)
             finally:
                 tui.close()
 
@@ -456,6 +605,7 @@ class TaskParsingTests(unittest.TestCase):
             runtime = types.SimpleNamespace(
                 queue_file=queue,
                 logs_dir=root / "logs",
+                repository_logs_dir=controller.repository_logs_path(root),
                 toolbar=lambda: " active: none ",
                 start=mock.Mock(),
                 stop=mock.Mock(),
@@ -538,6 +688,7 @@ class ControllerIntegrationTests(unittest.TestCase):
                         "--agent-command", command,
                         "--no-tmux",
                         "--non-interactive-mode",
+                        "--dangerously-skip-approvals",
                     ]
                 )
             finally:
@@ -545,14 +696,6 @@ class ControllerIntegrationTests(unittest.TestCase):
                 os.environ.update(previous)
             self.assertEqual(result, 0)
             queue = controller.queue_path(workspace)
-            controller.approve_tasks(queue, "all", workspace / "logs")
-            with mock.patch.dict(os.environ, env, clear=False):
-                result = controller.main(
-                    ["--config", str(config), "--workspace", str(workspace),
-                     "--agent-command", command, "--no-tmux",
-                     "--non-interactive-mode"]
-                )
-            self.assertEqual(result, 0)
             checkout = workspace / "task-repo"
             default_text = subprocess.run(
                 ["git", f"--git-dir={remote}", "show", "HEAD:tokenshare_tasklist.md"],
@@ -584,8 +727,25 @@ class ControllerIntegrationTests(unittest.TestCase):
                 self.assertFalse(any("status" in path or "/logs/" in f"/{path}/"
                                      for path in paths))
             local_logs = workspace / "logs"
-            self.assertTrue((local_logs / "tokenshare_agent_tasklist.md").is_file())
-            self.assertEqual(len(list(local_logs.glob("tokenshare-dev-*_log.md"))), 2)
+            self.assertTrue(
+                (local_logs / "agent" / "tokenshare_agent_tasklist.md").is_file()
+            )
+            self.assertEqual(
+                len(list((local_logs / "repos").glob("tokenshare-dev-*_log.md"))), 2
+            )
+
+            # Clearing local history must not make deterministic local review branches
+            # collide when the corresponding remote review branches were removed.
+            for branch in branches:
+                self.git("push", "origin", "--delete", branch, cwd=checkout)
+            controller.clear_controller_history(workspace, root / "state.json")
+            with mock.patch.dict(os.environ, env, clear=False):
+                result = controller.main(
+                    ["--config", str(config), "--workspace", str(workspace),
+                     "--agent-command", command, "--no-tmux",
+                     "--non-interactive-mode", "--dangerously-skip-approvals"]
+                )
+            self.assertEqual(result, 0)
 
     def test_default_stops_after_one_outstanding_task_branch(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -17,15 +17,17 @@ Operate Tokenshare as a persistent process. Treat the task text as the complete 
 
 ## Run and approve
 
-Run `tokenshare-controller`. New remote tasks are copied into `<development-directory>/logs/tokenshare_agent_tasklist.md` as `[Unapproved]` and cannot execute until a human reviews them and enters an `approve` command.
+Run `tokenshare-controller`. New remote tasks are copied into `<development-directory>/logs/agent/tokenshare_agent_tasklist.md` as `[Unapproved]` and cannot execute until a human reviews them and enters an `approve` command.
 
-Use `view`, `approve 1,3`, `approve 1:9`, `approve all`, or `approve all not 1,3`. Task numbers are stable and ranges are inclusive. Use `--workers N` for concurrency across repositories; only one task may execute in any repository. Use `-ni/--non-interactive-mode` to synchronize, drain previously approved work, and exit. The controller is a full-screen TUI. `--auto-attach TTY` requires a separate terminal already running a tmux client (`tmux new-session -A -s tokenshare-viewer`); plain-shell TTYs and the controller TTY are rejected.
+Use `view`, `approve 1,3`, `approve 1:9`, `approve all`, or `approve all not 1,3`. Task numbers are stable and ranges are inclusive. Use `--workers N` for concurrency across repositories; only one task may execute in any repository. Use `-ni/--non-interactive-mode` to synchronize, drain previously approved work, and exit. The controller is a full-screen TUI. `--auto-attach TTY` requires a separate terminal already running `tmux new-session -A -s tokenshare-viewer`; plain-shell TTYs and the controller TTY are rejected with setup guidance.
+
+`--dangerously-skip-approvals` immediately approves imported tasks without human review. Use it only for tasks authored by the agent owner. `-ch/--clear-history` silently clears local state, queue history, and repository task logs, then exits without initializing agents or viewers; it must preserve the controller audit log.
 
 ## Task contract
 
 Create deterministic review branches from the remote default branch and move each approved task from Pending to WIP to Done on its branch. Agents append progress and exact phase markers to the supplied local task log, leave changes uncommitted, and never push. The controller owns commits and publication.
 
-All controller, approval, and task logs belong under `<development-directory>/logs/`. Never create status or log files inside monitored repositories.
+Controller logs and the intake queue belong under `<development-directory>/logs/agent/`; repository task logs belong under `<development-directory>/logs/repos/`. Never create status or log files inside monitored repositories.
 
 Preserve the `allow-multiple-branches: true` configuration, managed-branch recovery, declined fingerprint tracking, indefinite agent retry, and optional `--auto-attach TTY` behavior.
 

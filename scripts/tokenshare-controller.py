@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -191,6 +192,16 @@ class Dashboard:
 
 
 DASHBOARD = Dashboard()
+
+
+def audit(message: str) -> None:
+    """Append to the durable controller log without rendering terminal output."""
+    rendered = f"[{dt.datetime.now(dt.timezone.utc).strftime(UTC_FORMAT)}] {message}"
+    with QUEUE_LOCK:
+        if CONTROLLER_LOG is not None:
+            CONTROLLER_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with CONTROLLER_LOG.open("a", encoding="utf-8") as stream:
+                stream.write(rendered + "\n")
 
 
 def log(message: str) -> None:
@@ -436,7 +447,15 @@ def append_task_log(path: Path, event: str, note: str = "") -> None:
 
 
 def queue_path(workspace: Path) -> Path:
-    return workspace / "logs" / "tokenshare_agent_tasklist.md"
+    return workspace / "logs" / "agent" / "tokenshare_agent_tasklist.md"
+
+
+def controller_log_path(workspace: Path) -> Path:
+    return workspace / "logs" / "agent" / "tokenshare-controller.log"
+
+
+def repository_logs_path(workspace: Path) -> Path:
+    return workspace / "logs" / "repos"
 
 
 def parse_queue(text: str) -> list[QueueTask]:
@@ -581,7 +600,13 @@ def parse_approval_selector(expression: str, eligible: set[int]) -> set[int]:
     return set(eligible) - selected if excluded else selected
 
 
-def approve_tasks(path: Path, expression: str, logs_dir: Path) -> list[int]:
+def approve_tasks(
+    path: Path,
+    expression: str,
+    logs_dir: Path,
+    *,
+    automatic: bool = False,
+) -> list[int]:
     with QUEUE_LOCK:
         tasks = load_queue(path)
         eligible = {task.number for task in tasks
@@ -595,10 +620,48 @@ def approve_tasks(path: Path, expression: str, logs_dir: Path) -> list[int]:
         for task in tasks:
             if task.number in selected:
                 task.approval = "Approved"
-                append_task_log(task_log_path(logs_dir, task.branch), "approved",
-                                f"Task #{task.number} approved by local operator")
+                event = "auto-approved" if automatic else "approved"
+                note = (
+                    f"Task #{task.number} automatically approved by "
+                    "--dangerously-skip-approvals"
+                    if automatic
+                    else f"Task #{task.number} approved by local operator"
+                )
+                append_task_log(task_log_path(logs_dir, task.branch), event, note)
         save_queue(path, tasks)
     return sorted(selected)
+
+
+def clear_controller_history(workspace: Path, state_path: Path) -> list[Path]:
+    """Remove local controller history while retaining controller audit logs."""
+    removed: list[Path] = []
+    protected = {
+        controller_log_path(workspace).resolve(),
+        (workspace / "logs" / "tokenshare-controller.log").resolve(),
+    }
+    for path in (
+        state_path,
+        queue_path(workspace),
+        workspace / "logs" / "tokenshare_agent_tasklist.md",
+    ):
+        if path.resolve() in protected:
+            continue
+        if path.is_dir():
+            raise TokenshareError(f"Refusing to clear history file because it is a directory: {path}")
+        if path.exists() or path.is_symlink():
+            path.unlink()
+            removed.append(path)
+    repository_logs = repository_logs_path(workspace)
+    if repository_logs.is_dir():
+        shutil.rmtree(repository_logs)
+        removed.append(repository_logs)
+    # Clear legacy per-task logs, but explicitly retain the legacy controller audit log.
+    legacy_logs = workspace / "logs"
+    if legacy_logs.is_dir():
+        for path in legacy_logs.glob(f"{BRANCH_PREFIX}*_log.md"):
+            path.unlink()
+            removed.append(path)
+    return removed
 
 
 def update_queue_task(path: Path, task_id: str, *, state: str | None = None,
@@ -613,6 +676,16 @@ def update_queue_task(path: Path, task_id: str, *, state: str | None = None,
         if approval is not None:
             matching.approval = approval
         save_queue(path, tasks)
+
+
+def queued_task_author(path: Path | None, task_id: str) -> str:
+    if path is None:
+        return "Unknown"
+    matching = next(
+        (task for task in load_queue(path) if task.task_id == task_id),
+        None,
+    )
+    return matching.author if matching is not None else "Unknown"
 
 
 def format_queue_view(tasks: Sequence[QueueTask]) -> str:
@@ -722,6 +795,37 @@ def remote_managed_branches(repo: Path) -> list[ManagedBranch]:
                 "complete" if matching.state == "Done" else "implementing", None, head,
             ))
     return records
+
+
+def local_managed_branch(
+    repo: Path, branch: str, expected_task_id: str
+) -> ManagedBranch | None:
+    """Recover a controller-owned local branch that has not been found remotely."""
+    exists = run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repo, check=False,
+    )
+    if exists.returncode:
+        return None
+    relative = str(find_tasklist(repo).relative_to(repo))
+    snapshot = run(["git", "show", f"{branch}:{relative}"], cwd=repo)
+    matching = next(
+        (task for task in parse_tasks(snapshot.stdout)
+         if task_fingerprint(task) == expected_task_id),
+        None,
+    )
+    if matching is None:
+        raise TokenshareError(
+            f"Local managed branch {branch} does not contain its expected task"
+        )
+    if matching.state == "Pending":
+        raise TokenshareError(
+            f"Local managed branch {branch} still contains a Pending task; "
+            "rename or delete that stale branch before retrying"
+        )
+    head = run(["git", "rev-parse", branch], cwd=repo).stdout.strip()
+    state = "complete" if matching.state == "Done" else "implementing"
+    return ManagedBranch(branch, expected_task_id, matching.title, state, None, head)
 
 
 def branch_is_merged(repo: Path, record: ManagedBranch, tasks: Sequence[Task]) -> bool:
@@ -1020,8 +1124,8 @@ def validate_attach_target(target: AttachTarget | None) -> AttachTarget | None:
     if matched is None:
         raise AttachmentError(
             f"--auto-attach target {target.path} has no tmux client. In the separate "
-            "terminal run 'tmux new-session -A -s tokenshare-viewer', then pass the "
-            "TTY reported by 'tty' from inside that tmux session"
+            "terminal run 'tmux new-session -A -s tokenshare-viewer', then run 'tty' "
+            "inside that session and pass the printed TTY path to the controller"
         )
     return AttachTarget(matched[2], False)
 
@@ -1398,9 +1502,18 @@ def process_task(
     logs_dir: Path | None = None,
     local_queue: Path | None = None,
 ) -> None:
-    DASHBOARD.set_task(repo, task.title)
+    if existing is None:
+        task_id = task_fingerprint(task)
+        existing = local_managed_branch(repo, task_branch_name(task), task_id)
     branch = existing.name if existing else task_branch_name(task)
     task_id = existing.task_id if existing else task_fingerprint(task)
+    author = queued_task_author(local_queue, task_id)
+    mode = "resume" if existing else "claim"
+    log(
+        f"Starting task: repo={repo.name}; author={author}; title={task.title}; "
+        f"branch={branch}; mode={mode}"
+    )
+    DASHBOARD.set_task(repo, task.title)
     if existing:
         status_path = task_log_path(logs_dir or repo.parent / "logs", branch)
         log(f"Resuming {repo.name}: {task.title} on {branch}")
@@ -1432,7 +1545,15 @@ def process_task(
                     f"Managed branch {branch} has remote changes and local uncommitted work"
                 )
         else:
-            run(["git", "merge", "--ff-only", f"origin/{branch}"], cwd=repo)
+            remote = run(
+                ["git", "show-ref", "--verify", "--quiet",
+                 f"refs/remotes/origin/{branch}"],
+                cwd=repo, check=False,
+            )
+            if remote.returncode == 0:
+                run(["git", "merge", "--ff-only", f"origin/{branch}"], cwd=repo)
+            else:
+                log(f"Resuming unpublished local managed branch {branch}")
         tasklist = find_tasklist(repo)
         branch_tasks = parse_tasks(tasklist.read_text(encoding="utf-8"))
         wip_task = next(
@@ -1714,6 +1835,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Synchronize, drain already-approved tasks, and exit",
     )
     parser.add_argument(
+        "--dangerously-skip-approvals", action="store_true",
+        help=("DANGER: immediately approve every imported task without human review; "
+              "use only for tasks authored by the agent owner"),
+    )
+    parser.add_argument(
+        "-ch", "--clear-history", action="store_true",
+        help=("Delete local controller state and task history, preserve the controller "
+              "audit log, and exit"),
+    )
+    parser.add_argument(
         "--workers", type=int,
         default=int(os.environ.get("TOKENSHARE_WORKERS", "1")),
         help="Maximum tasks running across different repositories (default: 1)",
@@ -1742,6 +1873,8 @@ class ControllerRuntime:
         self.auto_attach = auto_attach
         self.workspace = args.workspace.expanduser().resolve()
         self.logs_dir = self.workspace / "logs"
+        self.agent_logs_dir = self.logs_dir / "agent"
+        self.repository_logs_dir = repository_logs_path(self.workspace)
         self.queue_file = queue_path(self.workspace)
         self.state_path = Path(os.environ.get(
             "TOKENSHARE_STATE", Path.home() / ".config" / "tokenshare" / "state.json"
@@ -1763,12 +1896,13 @@ class ControllerRuntime:
         self.wake_event = threading.Event()
         self.last_error: Exception | None = None
         self.thread: threading.Thread | None = None
+        self.stopped = False
 
     def _worker(self, repo: Path) -> int:
         return scan_repositories(
             [repo], self.agent_command, state=self.state, state_path=self.state_path,
             use_tmux=not self.args.no_tmux, auto_attach=self.auto_attach,
-            logs_dir=self.logs_dir, local_queue=self.queue_file,
+            logs_dir=self.repository_logs_dir, local_queue=self.queue_file,
         )
 
     def cycle(self) -> bool:
@@ -1796,8 +1930,17 @@ class ControllerRuntime:
                 repo = sync_repo(url, self.workspace)
                 self.repos[name] = repo
                 imported, revoked = intake_remote_tasks(
-                    repo, self.queue_file, self.state, self.state_path, self.logs_dir
+                    repo, self.queue_file, self.state, self.state_path,
+                    self.repository_logs_dir,
                 )
+                if self.args.dangerously_skip_approvals:
+                    approved = approve_tasks(
+                        self.queue_file, "all", self.repository_logs_dir,
+                        automatic=True,
+                    )
+                    if approved:
+                        log("DANGER: automatically approved task(s): "
+                            + ", ".join(map(str, approved)))
                 progressed = bool(imported or revoked) or progressed
                 if imported or revoked:
                     self.blocked_until.pop(name, None)
@@ -1814,7 +1957,9 @@ class ControllerRuntime:
                 if (available <= 0 or name in self.active or name not in self.repos
                         or self.blocked_until.get(name, 0) > time.monotonic()):
                     continue
-                self.active[name] = self.executor.submit(self._worker, self.repos[name])
+                future = self.executor.submit(self._worker, self.repos[name])
+                future.add_done_callback(lambda _future: self.wake_event.set())
+                self.active[name] = future
                 available -= 1
                 progressed = True
         return progressed
@@ -1831,6 +1976,9 @@ class ControllerRuntime:
         self.thread.start()
 
     def stop(self) -> None:
+        if self.stopped:
+            return
+        self.stopped = True
         self.stop_event.set()
         self.wake_event.set()
         if self.thread is not None:
@@ -1855,16 +2003,32 @@ def handle_controller_command(command: str, runtime: ControllerRuntime,
         output(format_queue_view(tasks))
         for task in tasks:
             if task.state == "Pending" and task.approval == "Unapproved":
-                append_task_log(task_log_path(runtime.logs_dir, task.branch), "viewed-in-tui")
+                append_task_log(
+                    task_log_path(runtime.repository_logs_dir, task.branch),
+                    "viewed-in-tui",
+                )
         return True
     if value.startswith("approve "):
-        approved = approve_tasks(runtime.queue_file, value[8:], runtime.logs_dir)
+        approved = approve_tasks(
+            runtime.queue_file, value[8:], runtime.repository_logs_dir
+        )
         output("Approved: " + (", ".join(map(str, approved)) if approved else "none"))
         runtime.wake_event.set()
         return True
     if value == "help":
-        output("Commands: view | approve 1,3,7 | approve 1:9,11:15 | "
-               "approve all | approve all not 1,3 | help | quit")
+        output(
+            "usage: COMMAND [ARGS]\n\n"
+            "Commands:\n"
+            "  view                         Show the current task queue.\n"
+            "  approve SELECTOR             Approve matching unapproved tasks.\n"
+            "  help                         Show this help message.\n"
+            "  quit, exit                   Stop the controller.\n\n"
+            "Approval selectors:\n"
+            "  N[,N...]                     Task numbers, e.g. 1,3,7.\n"
+            "  START:END[,START:END...]     Inclusive ranges, e.g. 1:9,11:15.\n"
+            "  all                          Every eligible task.\n"
+            "  all not SELECTOR             Every eligible task except SELECTOR."
+        )
         return True
     if value in {"quit", "exit"}:
         return False
@@ -1880,7 +2044,9 @@ class ControllerTUI:
         try:
             from prompt_toolkit import Application
             from prompt_toolkit.key_binding import KeyBindings
-            from prompt_toolkit.layout import HSplit, Layout
+            from prompt_toolkit.formatted_text import FormattedText
+            from prompt_toolkit.layout import HSplit, Layout, Window
+            from prompt_toolkit.layout.controls import FormattedTextControl
             from prompt_toolkit.styles import Style
             from prompt_toolkit.widgets import Frame, Label, TextArea
         except ImportError as exc:
@@ -1894,10 +2060,14 @@ class ControllerTUI:
         self._events_lock = threading.Lock()
         self._queue_mtime_ns: int | None = None
         self.closed = False
+        self.task_height = 10
+        self._resize_dragging = False
+        self._resize_start_y = 0
+        self._resize_start_height = self.task_height
 
         self.task_area = TextArea(
             text="Loading tasks…", read_only=True, focusable=False,
-            scrollbar=True, wrap_lines=False, height=10,
+            scrollbar=True, wrap_lines=False,
         )
         self.log_area = TextArea(
             text="", read_only=True, focusable=False,
@@ -1908,10 +2078,43 @@ class ControllerTUI:
             accept_handler=self._accept_command,
         )
         self.status = Label(text=self.runtime.toolbar, style="class:status")
+        self.task_frame = Frame(
+            self.task_area,
+            title="Tasks",
+            height=lambda: self.task_height,
+        )
+        divider_control = FormattedTextControl(
+            FormattedText([("class:divider", " drag ↕ Tasks / Activity ")]),
+            focusable=False,
+        )
+        self.divider = Window(
+            content=divider_control, height=1, char="─", style="class:divider"
+        )
+
+        original_divider_mouse = self.divider._mouse_handler
+
+        def divider_mouse(mouse_event):
+            if self._handle_resize_mouse(mouse_event, self.divider):
+                return None
+            return original_divider_mouse(mouse_event)
+
+        self.divider._mouse_handler = divider_mouse
+
+        for window in (self.task_area.window, self.log_area.window):
+            original_control_mouse = window.content.mouse_handler
+
+            def pane_mouse(mouse_event, *, target=window, original=original_control_mouse):
+                if self._resize_dragging and self._handle_resize_mouse(mouse_event, target):
+                    return None
+                return original(mouse_event)
+
+            window.content.mouse_handler = pane_mouse
+
         root = HSplit([
             Label(" Tokenshare Controller  |  help: commands  |  Ctrl-C: quit ",
                   style="class:header"),
-            Frame(self.task_area, title="Tasks"),
+            self.task_frame,
+            self.divider,
             Frame(self.log_area, title="Activity"),
             self.status,
             self.command_area,
@@ -1933,10 +2136,21 @@ class ControllerTUI:
         def _page_down(event) -> None:
             self.log_area.window.vertical_scroll += 10
 
+        @bindings.add("c-up")
+        def _grow_tasks(event) -> None:
+            self._set_task_height(self.task_height + 1)
+            event.app.invalidate()
+
+        @bindings.add("c-down")
+        def _shrink_tasks(event) -> None:
+            self._set_task_height(self.task_height - 1)
+            event.app.invalidate()
+
         style = Style.from_dict({
             "header": "bold bg:#005f87 #ffffff",
             "status": "bg:#303030 #ffffff",
             "frame.label": "bold #00afff",
+            "divider": "bg:#444444 #ffffff",
         })
         self.application = Application(
             layout=Layout(root, focused_element=self.command_area),
@@ -1945,11 +2159,56 @@ class ControllerTUI:
             full_screen=True,
             refresh_interval=1.0,
             before_render=self._before_render,
+            mouse_support=True,
             input=input,
             output=output,
         )
         LOG_LISTENERS.append(self.enqueue_log)
         self.refresh_tasks(force=True)
+
+    def _set_task_height(self, height: int) -> None:
+        rows = self.application.output.get_size().rows if hasattr(self, "application") else 24
+        self.task_height = max(4, min(height, max(4, rows - 10)))
+
+    @staticmethod
+    def _screen_y(window, mouse_event) -> int:
+        info = window.render_info
+        if info is None:
+            return mouse_event.position.y
+        positions = [
+            y for (row, _column), (y, _x) in info._rowcol_to_yx.items()
+            if row == mouse_event.position.y
+        ]
+        return min(positions) if positions else info._y_offset + mouse_event.position.y
+
+    def _handle_resize_mouse(self, mouse_event, window) -> bool:
+        from prompt_toolkit.mouse_events import MouseEventType
+
+        event_type = mouse_event.event_type
+        if event_type == MouseEventType.SCROLL_UP:
+            self._set_task_height(self.task_height - 1)
+            return True
+        if event_type == MouseEventType.SCROLL_DOWN:
+            self._set_task_height(self.task_height + 1)
+            return True
+        screen_y = self._screen_y(window, mouse_event)
+        if event_type == MouseEventType.MOUSE_DOWN:
+            self._resize_dragging = True
+            self._resize_start_y = screen_y
+            self._resize_start_height = self.task_height
+            return True
+        if event_type == MouseEventType.MOUSE_MOVE and self._resize_dragging:
+            self._set_task_height(
+                self._resize_start_height + screen_y - self._resize_start_y
+            )
+            return True
+        if event_type == MouseEventType.MOUSE_UP and self._resize_dragging:
+            self._set_task_height(
+                self._resize_start_height + screen_y - self._resize_start_y
+            )
+            self._resize_dragging = False
+            return True
+        return False
 
     def enqueue_log(self, rendered: str) -> None:
         with self._events_lock:
@@ -2027,6 +2286,18 @@ def run_tui(runtime: ControllerRuntime) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     global CONTROLLER_LOG
     args = build_parser().parse_args(argv)
+    workspace = args.workspace.expanduser().resolve()
+    CONTROLLER_LOG = controller_log_path(workspace)
+    state_path = Path(os.environ.get(
+        "TOKENSHARE_STATE", Path.home() / ".config" / "tokenshare" / "state.json"
+    )).expanduser()
+    if args.clear_history:
+        DASHBOARD.enabled = False
+        audit(f"Clear-history requested for state {state_path}")
+        removed = clear_controller_history(workspace, state_path)
+        audit("Clear-history completed; controller audit log preserved; removed: "
+              + (", ".join(map(str, removed)) if removed else "nothing"))
+        return 0
     if args.poll_seconds <= 0:
         raise TokenshareError("--poll-seconds must be greater than zero")
     if args.workers <= 0:
@@ -2037,23 +2308,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     auto_attach = resolve_attach_target(args.auto_attach)
     auto_attach = validate_attach_target(auto_attach)
     runtime = ControllerRuntime(args, agent_command, auto_attach)
-    DASHBOARD.enabled = False
-    CONTROLLER_LOG = runtime.logs_dir / "tokenshare-controller.log"
-    load_queue(runtime.queue_file)
-    if args.non_interactive_mode:
-        while True:
-            progressed = runtime.cycle()
-            if runtime.last_error is not None:
-                runtime.stop()
-                raise TokenshareError(str(runtime.last_error))
-            if runtime.active:
-                time.sleep(0.1)
-                continue
-            if not progressed:
-                break
+    try:
+        DASHBOARD.enabled = False
+        CONTROLLER_LOG = controller_log_path(runtime.workspace)
+        load_queue(runtime.queue_file)
+        if args.dangerously_skip_approvals:
+            warning = (
+                "DANGER: --dangerously-skip-approvals is enabled. Every imported task "
+                "will run without human review. Use this only for tasks authored by the "
+                "owner of this agent."
+            )
+            log(warning)
+            print(warning, file=sys.stderr, flush=True)
+        if args.non_interactive_mode:
+            while True:
+                progressed = runtime.cycle()
+                if runtime.last_error is not None:
+                    raise TokenshareError(str(runtime.last_error))
+                if runtime.active:
+                    time.sleep(0.1)
+                    continue
+                if not progressed:
+                    break
+            runtime.stop()
+            return 0
+        return run_tui(runtime)
+    except BaseException:
         runtime.stop()
-        return 0
-    return run_tui(runtime)
+        raise
 
 
 if __name__ == "__main__":
