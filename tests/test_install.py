@@ -39,15 +39,29 @@ class InstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "home"
             workspace = Path(directory) / "workspace"
-            with mock.patch.dict("os.environ", {"CODEX_HOME": str(home / "codex")}):
+            environment = {
+                "CODEX_HOME": str(home / "codex"),
+                "CLAUDE_CONFIG_DIR": str(home / "claude"),
+                "XDG_CONFIG_HOME": str(home / "config"),
+            }
+            with mock.patch.dict("os.environ", environment, clear=True):
                 installer.install(workspace, home=home)
             self.assertTrue(workspace.is_dir())
             self.assertTrue((home / ".local/bin/tokenshare-controller").is_file())
-            installed_skill = home / "codex" / "skills" / "tokenshare"
-            self.assertTrue((installed_skill / "references" / "task-authoring.md").is_file())
-            skill_text = (installed_skill / "SKILL.md").read_text(encoding="utf-8")
-            self.assertIn("--create-task", skill_text)
-            self.assertIn("--grill-task", skill_text)
+            installed_skills = (
+                home / "codex" / "skills" / "tokenshare",
+                home / "claude" / "skills" / "tokenshare",
+                home / "config" / "opencode" / "skills" / "tokenshare",
+            )
+            for installed_skill in installed_skills:
+                self.assertTrue(
+                    (installed_skill / "references" / "task-authoring.md").is_file()
+                )
+                skill_text = (installed_skill / "SKILL.md").read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn("--create-task", skill_text)
+                self.assertIn("--grill-task", skill_text)
             metadata = json.loads(
                 (home / ".config/tokenshare/install.json").read_text(encoding="utf-8")
             )

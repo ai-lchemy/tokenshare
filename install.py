@@ -55,7 +55,17 @@ def install(development_directory: Path, *, home: Path | None = None) -> None:
     repo_dir = Path(__file__).resolve().parent
     home = home or Path.home()
     codex_home = Path(os.environ.get("CODEX_HOME", home / ".codex")).expanduser()
-    skill_dir = codex_home / "skills" / "tokenshare"
+    claude_home = Path(
+        os.environ.get("CLAUDE_CONFIG_DIR", home / ".claude")
+    ).expanduser()
+    xdg_config_home = Path(
+        os.environ.get("XDG_CONFIG_HOME", home / ".config")
+    ).expanduser()
+    skill_dirs = (
+        codex_home / "skills" / "tokenshare",
+        claude_home / "skills" / "tokenshare",
+        xdg_config_home / "opencode" / "skills" / "tokenshare",
+    )
     bin_dir = home / ".local" / "bin"
     metadata_path = home / ".config" / "tokenshare" / "install.json"
 
@@ -73,11 +83,13 @@ def install(development_directory: Path, *, home: Path | None = None) -> None:
             )
 
     development_directory.mkdir(parents=True, exist_ok=True)
-    skill_dir.mkdir(parents=True, exist_ok=True)
     bin_dir.mkdir(parents=True, exist_ok=True)
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
 
-    shutil.copytree(repo_dir / "skills" / "tokenshare", skill_dir, dirs_exist_ok=True)
+    for skill_dir in skill_dirs:
+        shutil.copytree(
+            repo_dir / "skills" / "tokenshare", skill_dir, dirs_exist_ok=True
+        )
     controller = bin_dir / "tokenshare-controller"
     shutil.copy2(repo_dir / "scripts" / "tokenshare-controller.py", controller)
     controller.chmod(controller.stat().st_mode | 0o111)
@@ -93,7 +105,8 @@ def install(development_directory: Path, *, home: Path | None = None) -> None:
         encoding="utf-8",
     )
 
-    print(f"Installed Tokenshare skill to {skill_dir}")
+    for skill_dir in skill_dirs:
+        print(f"Installed Tokenshare skill to {skill_dir}")
     print(f"Installed controller to {controller}")
     print(f"Repository config: {repo_dir / 'config' / 'task_repos.md'}")
     print(f"Development directory: {development_directory}")
