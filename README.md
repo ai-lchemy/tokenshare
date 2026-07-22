@@ -20,6 +20,12 @@ Tokenshare connects people who define work with people who own coding-agent infr
 
 ## Why Tokenshare?
 
+- Coding agent API prices are expensive yet the vast majority of consumers with monthly AI subscriptions struggle to use all their tokens.
+- Open source repos (especially small ones) do not have very much money to afford said coding agents, but they do have a vision for a real world product that will solve a problem.
+- My dream for tokenshare is to provide a means for open source developers to connect with and receive assistance through their supporters in order to make more and higher quality open source software for the world.
+
+## How it works
+
 Coding agents are good at implementation, but handing work between repositories, people, and machines still takes coordination. Tokenshare makes that handoff a versioned Git workflow.
 
 - **Git is the inbox.** Repository owners publish tasks in a small Markdown tasklist.
@@ -27,8 +33,6 @@ Coding agents are good at implementation, but handing work between repositories,
 - **Agents work unattended.** The controller handles cloning, branching, retries, session resume, commits, and pushes.
 - **Review stays familiar.** Each result lands on a `tokenshare-dev-...` branch, ready for a pull request.
 - **Execution stays local.** The agent owner chooses the machine, workspace, agent command, credentials, and concurrency.
-
-## How it works
 
 ```mermaid
 flowchart LR
