@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+# OpenCode unrestricted launcher
+# Model: kimi-k3
+# Permissions: auto-approve access
+
+exec opencode \
+    --model kimi-k3 \
+    --auto \
+    "$@"

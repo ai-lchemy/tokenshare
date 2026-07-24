@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+# Claude unrestricted launcher
+# Model: fable-5
+# Permissions: bypass permission checks
+
+exec claude \
+    --model fable-5 \
+    --dangerously-skip-permissions \
+    "$@"

@@ -127,6 +127,8 @@ allow-multiple-branches: false
 
 ### <task> [Pending] Concise Unique Title
 
+#### Allowed Models:
+
 #### Objective
 
 Describe the intended outcome and why it matters.
@@ -152,6 +154,20 @@ Describe the intended outcome and why it matters.
 ```
 
 Keep section names and task states exact. Task titles must be unique across Pending, WIP, and Completed sections. Changing or removing an unstarted remote task invalidates its previous snapshot and requires fresh approval.
+
+`#### Allowed Models:` is optional. Leave it blank (or omit it) to allow any
+agent model, or list exact model identifiers as double-quoted, comma-separated
+values:
+
+```markdown
+#### Allowed Models: "gpt-5.6-sol", "gpt-5.6-terra"
+```
+
+Restricted tasks can be approved, claimed, resumed, and completed only when
+Tokenshare is started with `-a/--agent` and that stub contains a matching literal
+`--model` argument. Matching is case-sensitive. Raw `--agent-command` values do
+not establish a model identity. Incompatible tasks remain visible with an
+`[Incompatible]` title prefix and are excluded from approval and execution.
 
 ### Author tasks with the skill
 

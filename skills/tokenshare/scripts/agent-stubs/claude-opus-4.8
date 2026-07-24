@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+# Claude unrestricted launcher
+# Model: opus-4.8
+# Permissions: bypass permission checks
+
+exec claude \
+    --model opus-4.8 \
+    --dangerously-skip-permissions \
+    "$@"

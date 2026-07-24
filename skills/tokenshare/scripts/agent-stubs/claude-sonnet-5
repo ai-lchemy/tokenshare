@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+# Claude unrestricted launcher
+# Model: sonnet-5
+# Permissions: bypass permission checks
+
+exec claude \
+    --model sonnet-5 \
+    --dangerously-skip-permissions \
+    "$@"

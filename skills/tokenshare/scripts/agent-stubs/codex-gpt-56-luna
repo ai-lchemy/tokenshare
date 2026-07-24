@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+# Codex unrestricted launcher
+# Model: gpt-5.6-luna
+# Reasoning: medium
+# Permissions: bypass approvals + sandbox
+
+exec codex \
+    --model gpt-5.6-luna \
+    --dangerously-bypass-approvals-and-sandbox \
+    "$@"

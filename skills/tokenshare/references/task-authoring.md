@@ -29,6 +29,8 @@ Write the final task as valid Markdown under `## Pending Tasks`:
 ```markdown
 ### <task> [Pending] Concise Unique Title
 
+#### Allowed Models:
+
 #### Objective
 
 Describe the intended outcome and why it matters.
@@ -51,6 +53,17 @@ Describe the intended outcome and why it matters.
 Omit empty headings. Keep the title unique across Pending, WIP, and Completed tasks. Do not add
 controller approval markers, task numbers, fingerprints, author metadata, or branch metadata to
 the repository tasklist.
+
+`#### Allowed Models:` is the exception to the empty-heading rule: include it when the repository
+owner wants to make model choice explicit. Leave it blank for unrestricted execution, or use exact,
+case-sensitive, double-quoted model identifiers separated by commas, for example:
+
+```markdown
+#### Allowed Models: "gpt-5.6-sol", "gpt-5.6-terra"
+```
+
+Restricted tasks require a controller `-a/--agent` stub with a matching literal `--model` value.
+Do not infer compatibility from the stub name or from a raw `--agent-command`.
 
 ## Missing tasklist
 

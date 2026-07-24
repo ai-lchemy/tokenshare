@@ -187,7 +187,7 @@ class TaskParsingTests(unittest.TestCase):
             Path(command),
             SCRIPT.parents[1]
             / "skills" / "tokenshare" / "scripts" / "agent-stubs"
-            / "codex-gpt-56-sol.sh",
+            / "codex-gpt-56-sol",
         )
         with tempfile.TemporaryDirectory() as directory:
             stub = Path(directory) / "custom-agent"
@@ -200,6 +200,71 @@ class TaskParsingTests(unittest.TestCase):
     def test_agent_flag_rejects_missing_stub(self):
         with self.assertRaisesRegex(controller.TokenshareError, "not found"):
             controller.resolve_agent_command("definitely-missing-agent", "unused")
+
+    def test_agent_stub_model_is_read_from_literal_model_argument(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spaced = root / "spaced"
+            spaced.write_text(
+                "#!/bin/sh\n# --model ignored-comment\nexec codex --model exact-model \"$@\"\n",
+                encoding="utf-8",
+            )
+            spaced.chmod(0o755)
+            self.assertEqual(
+                controller.resolve_agent(str(spaced), "unused").model,
+                "exact-model",
+            )
+            equals = root / "equals"
+            equals.write_text(
+                "#!/bin/sh\nexec codex --model=\"other-model\" \"$@\"\n",
+                encoding="utf-8",
+            )
+            equals.chmod(0o755)
+            self.assertEqual(controller.model_from_agent_stub(equals), "other-model")
+
+    def test_agent_stub_rejects_nonliteral_or_conflicting_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            variable = root / "variable"
+            variable.write_text(
+                "#!/bin/sh\nexec codex --model \"$MODEL\" \"$@\"\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(controller.TokenshareError, "literal"):
+                controller.model_from_agent_stub(variable)
+            conflicting = root / "conflicting"
+            conflicting.write_text(
+                "#!/bin/sh\nexec codex --model one --model=two \"$@\"\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(controller.TokenshareError, "conflicting"):
+                controller.model_from_agent_stub(conflicting)
+
+    def test_raw_agent_command_has_no_verified_model(self):
+        resolved = controller.resolve_agent(None, "codex --model gpt-5.6-sol")
+        self.assertEqual(resolved.command, "codex --model gpt-5.6-sol")
+        self.assertIsNone(resolved.model)
+
+    def test_process_task_refuses_incompatible_model_before_claim(self):
+        restricted = controller.parse_tasks(
+            TASKLIST.replace(
+                "- Do the work.",
+                '#### Allowed Models: "gpt-5.6-sol"\n- Do the work.',
+            )
+        )[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(controller, "run") as run_mock:
+                with self.assertRaisesRegex(controller.TokenshareError, "Refusing"):
+                    controller.process_task(
+                        root,
+                        restricted,
+                        "agent",
+                        agent_model="gpt-5.6-terra",
+                        state={},
+                        state_path=root / "state.json",
+                    )
+            run_mock.assert_not_called()
 
     def test_codex_command_trusts_the_task_repo_for_the_invocation(self):
         repo = Path("/tmp/task repo")
@@ -303,6 +368,51 @@ class TaskParsingTests(unittest.TestCase):
             controller.task_fingerprint(task),
             controller.task_fingerprint(controller.parse_tasks(moved)[0]),
         )
+
+    def test_allowed_models_are_optional_blank_or_exact(self):
+        missing = controller.parse_tasks(TASKLIST)[0]
+        blank_text = TASKLIST.replace(
+            "- Do the work.", '#### Allowed Models:\n- Do the work.',
+        )
+        blank = controller.parse_tasks(blank_text)[0]
+        restricted_text = TASKLIST.replace(
+            "- Do the work.",
+            '#### Allowed Models: "gpt-5.6-sol", "gpt-5.6-terra"\n- Do the work.',
+        )
+        restricted = controller.parse_tasks(restricted_text)[0]
+        self.assertEqual(missing.allowed_models, ())
+        self.assertEqual(blank.allowed_models, ())
+        self.assertEqual(
+            restricted.allowed_models, ("gpt-5.6-sol", "gpt-5.6-terra")
+        )
+        self.assertTrue(controller.model_is_compatible(restricted, "gpt-5.6-sol"))
+        self.assertFalse(controller.model_is_compatible(restricted, "GPT-5.6-SOL"))
+        self.assertFalse(controller.model_is_compatible(restricted, None))
+        self.assertNotEqual(
+            controller.task_fingerprint(missing),
+            controller.task_fingerprint(restricted),
+        )
+
+    def test_allowed_models_reject_malformed_duplicate_or_empty_values(self):
+        malformed_values = (
+            "gpt-5.6-sol",
+            '"gpt-5.6-sol", terra',
+            '""',
+            '"gpt-5.6-sol", "gpt-5.6-sol"',
+        )
+        for value in malformed_values:
+            with self.subTest(value=value), self.assertRaises(controller.TokenshareError):
+                controller.parse_tasks(
+                    TASKLIST.replace(
+                        "- Do the work.", f"#### Allowed Models: {value}\n- Do the work."
+                    )
+                )
+        duplicate_heading = TASKLIST.replace(
+            "- Do the work.",
+            '#### Allowed Models:\n#### Allowed Models: "gpt-5.6-sol"\n- Do the work.',
+        )
+        with self.assertRaisesRegex(controller.TokenshareError, "duplicate"):
+            controller.parse_tasks(duplicate_heading)
 
     def test_tasklist_configuration_is_strict_and_defaults_to_one_branch(self):
         self.assertFalse(controller.parse_tasklist_config(TASKLIST).allow_multiple_branches)
@@ -413,6 +523,67 @@ class TaskParsingTests(unittest.TestCase):
             self.assertEqual(approved.approval, "Approved")
             self.assertIsNone(approved.number)
             self.assertTrue(controller.task_log_path(root / "logs", item.branch).is_file())
+
+    def test_incompatible_tasks_are_tagged_and_cannot_be_approved(self):
+        restricted_text = TASKLIST.replace(
+            "- Do the work.",
+            '#### Allowed Models: "gpt-5.6-sol"\n- Do the work.',
+        )
+        restricted = controller.parse_tasks(restricted_text)[0]
+        unrestricted = controller.parse_tasks(TASKLIST)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue = controller.queue_path(root)
+            first = controller.queue_task_from_remote(
+                1, restricted, Path("/tmp/repo"), "remote", "a" * 40, "Author",
+            )
+            second = dataclasses.replace(
+                controller.queue_task_from_remote(
+                    2, unrestricted, Path("/tmp/repo"), "remote", "b" * 40, "Author",
+                ),
+                task_id="b" * 64,
+                title="Unrestricted",
+            )
+            controller.save_queue(queue, [first, second])
+            view = controller.format_queue_view(
+                controller.load_queue(queue), "gpt-5.6-terra"
+            )
+            self.assertIn("[Incompatible] Implement Awesome Feature", view)
+            self.assertNotIn("[Incompatible] Unrestricted", view)
+            with self.assertRaisesRegex(controller.TokenshareError, "Cannot approve"):
+                controller.approve_tasks(
+                    queue, "1", root / "logs", agent_model="gpt-5.6-terra"
+                )
+            self.assertEqual(
+                controller.approve_tasks(
+                    queue, "all", root / "logs", agent_model="gpt-5.6-terra"
+                ),
+                [2],
+            )
+            remaining = controller.load_queue(queue)
+            self.assertEqual(remaining[0].approval, "Unapproved")
+            self.assertEqual(remaining[0].number, 1)
+
+    def test_compatible_model_can_approve_restricted_task(self):
+        restricted = controller.parse_tasks(
+            TASKLIST.replace(
+                "- Do the work.",
+                '#### Allowed Models: "gpt-5.6-sol"\n- Do the work.',
+            )
+        )[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue = controller.queue_path(root)
+            item = controller.queue_task_from_remote(
+                1, restricted, Path("/tmp/repo"), "remote", "a" * 40, "Author",
+            )
+            controller.save_queue(queue, [item])
+            self.assertEqual(
+                controller.approve_tasks(
+                    queue, "1", root / "logs", agent_model="gpt-5.6-sol"
+                ),
+                [1],
+            )
 
     def test_approval_atomically_renumbers_remaining_unapproved_tasks(self):
         remote = controller.parse_tasks(TASKLIST)[0]
@@ -548,7 +719,7 @@ class TaskParsingTests(unittest.TestCase):
                 with mock.patch.dict(
                     os.environ, {"TOKENSHARE_STATE": str(state)}, clear=False
                 ), mock.patch.object(
-                    controller, "resolve_agent_command"
+                    controller, "resolve_agent"
                 ) as resolve_agent, mock.patch.object(
                     controller, "ControllerRuntime"
                 ) as runtime, mock.patch("sys.stdout", stdout), mock.patch(

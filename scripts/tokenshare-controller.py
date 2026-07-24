@@ -41,6 +41,7 @@ class Task:
     body: str
     start: int
     end: int
+    allowed_models: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass
@@ -80,11 +81,20 @@ class AttachTarget:
     is_controller_tty: bool
 
 
+@dataclasses.dataclass(frozen=True)
+class ResolvedAgent:
+    command: str
+    model: str | None
+
+
 TASK_START = re.compile(
     r"^###\s+<task>\s+\[(Pending|WIP|Done)\]\s+(.+?)\s*$", re.MULTILINE
 )
 TASK_MARKER = re.compile(r"^###\s+<task>.*$", re.MULTILINE)
 TASK_END = re.compile(r"^###\s+</task>\s*$", re.MULTILINE)
+ALLOWED_MODELS = re.compile(
+    r"^####[ \t]+Allowed Models:[ \t]*(.*?)[ \t]*$", re.MULTILINE
+)
 SECTION_FOR_STATE = {
     "Pending": "Pending Tasks",
     "WIP": "WIP Tasks",
@@ -366,13 +376,15 @@ def parse_tasks(text: str) -> list[Task]:
             raise TokenshareError(
                 f"Task {start_match.group(2)!r} is [{state}] but is not under ## {expected_section}"
             )
+        body = text[start_match.start() : block_end]
         tasks.append(
             Task(
                 state=state,
                 title=start_match.group(2).strip(),
-                body=text[start_match.start() : block_end],
+                body=body,
                 start=start_match.start(),
                 end=block_end,
+                allowed_models=parse_allowed_models(body, start_match.group(2).strip()),
             )
         )
         cursor = block_end
@@ -381,6 +393,46 @@ def parse_tasks(text: str) -> list[Task]:
     if duplicates:
         raise TokenshareError(f"Duplicate task title(s): {', '.join(duplicates)}")
     return tasks
+
+
+def parse_allowed_models(body: str, title: str = "task") -> tuple[str, ...]:
+    matches = ALLOWED_MODELS.findall(body)
+    if len(matches) > 1:
+        raise TokenshareError(f"Task {title!r} has duplicate Allowed Models headings")
+    if not matches or not matches[0].strip():
+        return ()
+    value = matches[0]
+    if re.fullmatch(
+        r'[ \t]*"[^"\r\n]*"[ \t]*(?:,[ \t]*"[^"\r\n]*"[ \t]*)*',
+        value,
+    ) is None:
+        raise TokenshareError(
+            f"Task {title!r} has malformed Allowed Models; expected "
+            '"MODEL-1", "MODEL-2"'
+        )
+    models = tuple(item.strip() for item in re.findall(r'"([^"\r\n]*)"', value))
+    if any(not model for model in models):
+        raise TokenshareError(f"Task {title!r} has an empty Allowed Models entry")
+    if len(models) != len(set(models)):
+        raise TokenshareError(f"Task {title!r} has duplicate Allowed Models entries")
+    return models
+
+
+def task_allowed_models(task: Task | QueueTask) -> tuple[str, ...]:
+    if isinstance(task, Task):
+        return task.allowed_models
+    return parse_allowed_models(task.body, task.title)
+
+
+def model_is_compatible(task: Task | QueueTask, model: str | None) -> bool:
+    allowed = task_allowed_models(task)
+    return not allowed or model in allowed
+
+
+def incompatible_model_message(task: Task | QueueTask, model: str | None) -> str:
+    active = model if model is not None else "unknown (no -a stub model)"
+    allowed = ", ".join(task_allowed_models(task))
+    return f"active model {active!r} is incompatible; allowed models: {allowed}"
 
 
 def parse_tasklist_config(text: str) -> TasklistConfig:
@@ -651,19 +703,39 @@ def approve_tasks(
     logs_dir: Path,
     *,
     automatic: bool = False,
+    agent_model: str | None = None,
 ) -> list[int]:
     with QUEUE_LOCK:
         tasks = load_queue(path)
         normalize_queue_numbers(tasks)
-        eligible = {task.number for task in tasks
-                    if task.state == "Pending" and task.approval == "Unapproved"
-                    and task.number is not None}
-        selected = parse_approval_selector(expression, eligible)
-        unknown = selected - eligible
+        unapproved = {
+            task.number: task for task in tasks
+            if task.state == "Pending" and task.approval == "Unapproved"
+            and task.number is not None
+        }
+        eligible = {
+            number for number, task in unapproved.items()
+            if model_is_compatible(task, agent_model)
+        }
+        all_selector = expression.strip().lower() == "all" or expression.strip().lower().startswith(
+            "all not "
+        )
+        selected = parse_approval_selector(
+            expression, eligible if all_selector else set(unapproved)
+        )
+        unknown = selected - set(unapproved)
         if unknown:
             raise TokenshareError(
                 "not eligible for approval: " + ", ".join(map(str, sorted(unknown)))
             )
+        incompatible = selected - eligible
+        if incompatible:
+            details = "; ".join(
+                f"#{number} {unapproved[number].title}: "
+                f"{incompatible_model_message(unapproved[number], agent_model)}"
+                for number in sorted(incompatible)
+            )
+            raise TokenshareError(f"Cannot approve incompatible task(s): {details}")
         for task in tasks:
             if task.number in selected:
                 task.approval = "Approved"
@@ -737,7 +809,9 @@ def queued_task_author(path: Path | None, task_id: str) -> str:
     return matching.author if matching is not None else "Unknown"
 
 
-def format_queue_view(tasks: Sequence[QueueTask]) -> str:
+def format_queue_view(
+    tasks: Sequence[QueueTask], agent_model: str | None = None
+) -> str:
     priority = {("Pending", "Unapproved"): 0, ("Pending", "Approved"): 1,
                 ("WIP", "Approved"): 2, ("Done", "Approved"): 3}
     normalize_queue_numbers(tasks)
@@ -750,9 +824,14 @@ def format_queue_view(tasks: Sequence[QueueTask]) -> str:
     rows = [header, "-" * len(header)]
     for task in ordered:
         number = str(task.number) if task.number is not None else ""
+        title = (
+            task.title
+            if model_is_compatible(task, agent_model)
+            else f"[Incompatible] {task.title}"
+        )
         rows.append(
             f"{number:<3}{task.state:<9}{task.approval:<12}"
-            f"{task.repo_name[:18]:<20}{task.author[:19]:<21}{task.title}"
+            f"{task.repo_name[:18]:<20}{task.author[:19]:<21}{title}"
         )
     return "\n".join(rows) if ordered else "No tasks have been imported."
 
@@ -1079,10 +1158,43 @@ def _agent_args(
     return [*args, prompt]
 
 
-def resolve_agent_command(agent: str | None, agent_command: str) -> str:
-    """Resolve an agent stub name/path, falling back to the raw command."""
+def model_from_agent_stub(stub: Path) -> str | None:
+    try:
+        tokens = shlex.split(stub.read_text(encoding="utf-8"), comments=True)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise TokenshareError(f"Cannot inspect agent stub {stub}: {exc}") from exc
+    models: list[str] = []
+    for index, token in enumerate(tokens):
+        if token == "--model":
+            if index + 1 >= len(tokens) or tokens[index + 1].startswith("-"):
+                raise TokenshareError(f"Agent stub {stub} has --model without a value")
+            models.append(tokens[index + 1])
+        elif token.startswith("--model="):
+            value = token.partition("=")[2]
+            if not value:
+                raise TokenshareError(f"Agent stub {stub} has --model without a value")
+            models.append(value)
+    literal_models = [
+        model for model in models
+        if not any(marker in model for marker in ("$", "`"))
+    ]
+    if len(literal_models) != len(models):
+        raise TokenshareError(
+            f"Agent stub {stub} must use a literal value for --model"
+        )
+    distinct = set(models)
+    if len(distinct) > 1:
+        raise TokenshareError(
+            f"Agent stub {stub} has conflicting --model values: "
+            + ", ".join(sorted(distinct))
+        )
+    return models[0] if models else None
+
+
+def resolve_agent(agent: str | None, agent_command: str) -> ResolvedAgent:
+    """Resolve an agent command and the literal model declared by its stub."""
     if not agent:
-        return agent_command
+        return ResolvedAgent(agent_command, None)
     requested = Path(agent).expanduser()
     candidates: list[Path]
     if requested.is_absolute() or requested.parent != Path("."):
@@ -1102,7 +1214,12 @@ def resolve_agent_command(agent: str | None, agent_command: str) -> str:
         raise TokenshareError(f"Agent stub {agent!r} not found (searched: {searched})")
     if not os.access(stub, os.X_OK):
         raise TokenshareError(f"Agent stub is not executable: {stub}")
-    return shlex.quote(str(stub))
+    return ResolvedAgent(shlex.quote(str(stub)), model_from_agent_stub(stub))
+
+
+def resolve_agent_command(agent: str | None, agent_command: str) -> str:
+    """Compatibility wrapper returning only the resolved command."""
+    return resolve_agent(agent, agent_command).command
 
 
 def _log_blocks(text: str) -> list[tuple[str, str]]:
@@ -1553,6 +1670,7 @@ def process_task(
     task: Task,
     agent_command: str,
     *,
+    agent_model: str | None = None,
     state: dict,
     state_path: Path,
     existing: ManagedBranch | None = None,
@@ -1561,6 +1679,11 @@ def process_task(
     logs_dir: Path | None = None,
     local_queue: Path | None = None,
 ) -> None:
+    if not model_is_compatible(task, agent_model):
+        raise TokenshareError(
+            f"Refusing to process {task.title!r}: "
+            f"{incompatible_model_message(task, agent_model)}"
+        )
     if existing is None:
         task_id = task_fingerprint(task)
         existing = local_managed_branch(repo, task_branch_name(task), task_id)
@@ -1714,6 +1837,7 @@ def scan_repositories(
     repos: Sequence[Path],
     agent_command: str,
     *,
+    agent_model: str | None = None,
     state: dict,
     state_path: Path,
     use_tmux: bool = True,
@@ -1739,8 +1863,16 @@ def scan_repositories(
                     item for item in parse_tasks(branch_tasklist.read_text(encoding="utf-8"))
                     if item.title == record.title
                 )
+                if not model_is_compatible(branch_task, agent_model):
+                    log(
+                        f"Skipping incompatible managed task in {repo.name}: "
+                        f"{branch_task.title}; "
+                        f"{incompatible_model_message(branch_task, agent_model)}"
+                    )
+                    continue
                 process_task(
-                    repo, branch_task, agent_command, state=state, state_path=state_path,
+                    repo, branch_task, agent_command, agent_model=agent_model,
+                    state=state, state_path=state_path,
                     existing=record, use_tmux=use_tmux, auto_attach=auto_attach,
                     logs_dir=logs_dir, local_queue=local_queue,
                 )
@@ -1788,8 +1920,16 @@ def scan_repositories(
                     task for task in tasks
                     if task.title == incomplete.title
                 )
+                if not model_is_compatible(branch_task, agent_model):
+                    log(
+                        f"Skipping incompatible managed task in {repo.name}: "
+                        f"{branch_task.title}; "
+                        f"{incompatible_model_message(branch_task, agent_model)}"
+                    )
+                    continue
                 process_task(
-                    repo, branch_task, agent_command, state=state, state_path=state_path,
+                    repo, branch_task, agent_command, agent_model=agent_model,
+                    state=state, state_path=state_path,
                     existing=incomplete, use_tmux=use_tmux, auto_attach=auto_attach,
                     logs_dir=logs_dir, local_queue=local_queue,
                 )
@@ -1812,12 +1952,33 @@ def scan_repositories(
                 }
             pending = next((task for task in tasks if task.state == "Pending"
                             and task_fingerprint(task) not in active_ids | declined
-                            and (approved_ids is None or task_fingerprint(task) in approved_ids)),
+                            and (approved_ids is None or task_fingerprint(task) in approved_ids)
+                            and model_is_compatible(task, agent_model)),
                            None)
             if pending is None:
+                incompatible = next(
+                    (
+                        task for task in tasks
+                        if task.state == "Pending"
+                        and task_fingerprint(task) not in active_ids | declined
+                        and (
+                            approved_ids is None
+                            or task_fingerprint(task) in approved_ids
+                        )
+                        and not model_is_compatible(task, agent_model)
+                    ),
+                    None,
+                )
+                if incompatible is not None:
+                    log(
+                        f"Skipping incompatible task in {repo.name}: "
+                        f"{incompatible.title}; "
+                        f"{incompatible_model_message(incompatible, agent_model)}"
+                    )
                 continue
             process_task(
-                repo, pending, agent_command, state=state, state_path=state_path,
+                repo, pending, agent_command, agent_model=agent_model,
+                state=state, state_path=state_path,
                 use_tmux=use_tmux, auto_attach=auto_attach,
                 logs_dir=logs_dir, local_queue=local_queue,
             )
@@ -1923,12 +2084,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 class ControllerRuntime:
     def __init__(self, args: argparse.Namespace, agent_command: str,
-                 auto_attach: AttachTarget | None) -> None:
+                 auto_attach: AttachTarget | None,
+                 agent_model: str | None = None) -> None:
         global CONTROLLER_STOP_EVENT
         from concurrent.futures import ThreadPoolExecutor
 
         self.args = args
         self.agent_command = agent_command
+        self.agent_model = agent_model
         self.auto_attach = auto_attach
         self.workspace = args.workspace.expanduser().resolve()
         self.logs_dir = self.workspace / "logs"
@@ -1961,7 +2124,8 @@ class ControllerRuntime:
 
     def _worker(self, repo: Path) -> int:
         return scan_repositories(
-            [repo], self.agent_command, state=self.state, state_path=self.state_path,
+            [repo], self.agent_command, agent_model=self.agent_model,
+            state=self.state, state_path=self.state_path,
             use_tmux=not self.args.no_tmux, auto_attach=self.auto_attach,
             logs_dir=self.repository_logs_dir, local_queue=self.queue_file,
         )
@@ -1998,6 +2162,7 @@ class ControllerRuntime:
                     approved = approve_tasks(
                         self.queue_file, "all", self.repository_logs_dir,
                         automatic=True,
+                        agent_model=self.agent_model,
                     )
                     if approved:
                         log("DANGER: automatically approved task(s): "
@@ -2013,6 +2178,7 @@ class ControllerRuntime:
             approved_repos = {
                 task.repo_name for task in load_queue(self.queue_file)
                 if task.state == "Pending" and task.approval == "Approved"
+                and model_is_compatible(task, self.agent_model)
             }
             for name in sorted(approved_repos):
                 if (available <= 0 or name in self.active or name not in self.repos
@@ -2061,7 +2227,7 @@ def handle_controller_command(command: str, runtime: ControllerRuntime,
         return True
     if value == "view":
         tasks = load_queue(runtime.queue_file)
-        output(format_queue_view(tasks))
+        output(format_queue_view(tasks, getattr(runtime, "agent_model", None)))
         for task in tasks:
             if task.state == "Pending" and task.approval == "Unapproved":
                 append_task_log(
@@ -2071,7 +2237,8 @@ def handle_controller_command(command: str, runtime: ControllerRuntime,
         return True
     if value.startswith("approve "):
         approved = approve_tasks(
-            runtime.queue_file, value[8:], runtime.repository_logs_dir
+            runtime.queue_file, value[8:], runtime.repository_logs_dir,
+            agent_model=getattr(runtime, "agent_model", None),
         )
         output("Approved: " + (", ".join(map(str, approved)) if approved else "none"))
         runtime.wake_event.set()
@@ -2294,7 +2461,10 @@ class ControllerTUI:
         if not force and mtime == self._queue_mtime_ns:
             return
         self._queue_mtime_ns = mtime
-        self.task_area.text = format_queue_view(load_queue(self.runtime.queue_file))
+        self.task_area.text = format_queue_view(
+            load_queue(self.runtime.queue_file),
+            getattr(self.runtime, "agent_model", None),
+        )
 
     def _before_render(self, _app) -> None:
         self._drain_events()
@@ -2365,10 +2535,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise TokenshareError("--workers must be greater than zero")
     if args.no_tmux and args.auto_attach:
         raise TokenshareError("--auto-attach cannot be used with --no-tmux")
-    agent_command = resolve_agent_command(args.agent, args.agent_command)
+    resolved_agent = resolve_agent(args.agent, args.agent_command)
     auto_attach = resolve_attach_target(args.auto_attach)
     auto_attach = validate_attach_target(auto_attach)
-    runtime = ControllerRuntime(args, agent_command, auto_attach)
+    runtime = ControllerRuntime(
+        args, resolved_agent.command, auto_attach, resolved_agent.model
+    )
     try:
         DASHBOARD.enabled = False
         CONTROLLER_LOG = controller_log_path(runtime.workspace)
