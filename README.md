@@ -8,6 +8,8 @@ An approval-gated controller that turns tasks published in Git repositories into
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3](https://img.shields.io/badge/Python-3.x-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Release downloads](https://img.shields.io/github/downloads/ai-lchemy/tokenshare/total?color=blue&label=downloads)](https://github.com/ai-lchemy/tokenshare/releases)
+[![GitHub Discussions](https://img.shields.io/badge/GitHub-Discussions-8957e5?logo=github&logoColor=white)](https://github.com/ai-lchemy/tokenshare/discussions)
 
 [Why Tokenshare?](#why-tokenshare) · [Quick start](#quick-start) · [Write a task](#write-a-task) · [How it works](#how-it-works) · [Security](#security)
 
