@@ -246,6 +246,10 @@ The remote tasklist is the trust boundary. A repository owner can place arbitrar
 
 Tokenshare stops on inaccessible repositories, conflicting tasklists, remote-default-branch WIP tasks, and unrelated dirty working trees. These checks reduce accidental damage; they do not create a security sandbox.
 
+## Contact
+
+**Business, partnership, or media inquiries:** [ai.lchemy.dev@gmail.com](mailto:ai.lchemy.dev@gmail.com)
+
 ## Development
 
 Run the test suite and syntax check from the repository root:
